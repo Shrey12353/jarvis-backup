@@ -1,0 +1,955 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis</title>
+<style>
+  :root {
+    --bg: #212121; --panel: #171717; --bubble-user: #2f2f2f; --bubble-ai: #171717;
+    --text: #ececec; --muted: #8e8ea0; --accent: #10a37f; --accent-hover: #0e906f;
+    --danger: #ef4444; --card: #2a2a2a; --border: #3a3a3a;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background: var(--bg); color: var(--text);
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  }
+  button {
+    font: inherit; color: var(--text); background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px 14px; cursor: pointer; transition: background .15s;
+  }
+  button:hover { background: #333; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: var(--accent-hover); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  /* ---------- layout ---------- */
+  #app { display: flex; flex: 1 1 auto; min-height: 0; }
+  /* ---------- sidebar ---------- */
+  #sidebar {
+    width: 260px; flex: 0 0 260px; background: var(--panel); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  #sidebar .side-head { padding: 14px 14px 10px; display: flex; align-items: center; justify-content: space-between; }
+  #sidebar .side-head .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+  .logo {
+    width: 30px; height: 30px; border-radius: 50%;
+    background: radial-gradient(circle at 30% 30%, #19c39c, #0b6e57 70%);
+    display: grid; place-items: center; font-size: 15px; color: #fff; flex: 0 0 30px;
+  }
+  #newChatBtn { width: 100%; margin: 0 14px 10px; width: calc(100% - 28px); text-align: left; }
+  #chatList { flex: 1 1 auto; overflow-y: auto; padding: 4px 8px 12px; }
+  .chat-item {
+    display: flex; align-items: center; gap: 6px; padding: 9px 10px; border-radius: 10px;
+    cursor: pointer; color: var(--text); font-size: 13.5px; margin: 2px 0;
+  }
+  .chat-item:hover { background: #262626; }
+  .chat-item.active { background: #2f2f2f; }
+  .chat-item .t { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chat-item .del { visibility: hidden; border: none; background: none; color: var(--muted); padding: 0 4px; font-size: 15px; }
+  .chat-item:hover .del { visibility: visible; }
+  .chat-item .del:hover { color: var(--danger); }
+  .side-foot { padding: 10px 14px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block; margin-left: 6px; }
+  .status-dot.bad { background: var(--danger); }
+  .status-dot.busy { background: #f59e0b; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  /* ---------- chat column ---------- */
+  #right { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel); flex: 0 0 auto;
+  }
+  header .actions { display: flex; gap: 8px; }
+  main#chat { flex: 1 1 auto; overflow-y: auto; padding: 24px 0; scroll-behavior: smooth; }
+  .col { max-width: 760px; margin: 0 auto; padding: 0 20px; }
+  .msg { display: flex; gap: 14px; margin: 18px 0; animation: fadein .25s ease; }
+  @keyframes fadein { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: none; } }
+  .avatar { flex: 0 0 30px; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; font-size: 14px; margin-top: 2px; }
+  .msg.user .avatar { background: #5b6470; color: #fff; }
+  .msg.ai .avatar { background: radial-gradient(circle at 30% 30%, #19c39c, #0b6e57 70%); color: #fff; }
+  .msg .body { min-width: 0; flex: 1; line-height: 1.6; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user .body { background: var(--bubble-user); padding: 12px 16px; border-radius: 14px; }
+  .msg.ai .body { padding: 2px 0; }
+  .meta { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .tools { margin: 6px 0 10px; display: flex; flex-direction: column; gap: 6px; }
+  .tool-chip {
+    display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted);
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
+  }
+  .tool-chip .dot { width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; flex: 0 0 7px; }
+  .tool-chip.ok .dot { background: var(--accent); }
+  .tool-chip.fail .dot { background: var(--danger); }
+  .tool-chip code { color: #c3c3c3; background: none; padding: 0; }
+  .typing { display: inline-flex; gap: 4px; padding: 6px 0; }
+  .typing span { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
+  .typing span:nth-child(2) { animation-delay: .2s; }
+  .typing span:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%,100% { opacity: .25; } 50% { opacity: 1; } }
+  .tool-summary { font-size: 12px; color: var(--muted); margin: 4px 0 8px; }
+  .approval { background: #33261d; border: 1px solid #7c5b33; border-radius: 12px; padding: 12px 14px; margin: 8px 0; font-size: 14px; }
+  .approval b { color: #fbbf24; }
+  .approval .row { display: flex; gap: 8px; margin-top: 10px; }
+  .cursor { display: inline-block; width: 8px; height: 16px; background: var(--accent); animation: blink 1s infinite; vertical-align: text-bottom; }
+  /* ---------- composer ---------- */
+  footer { flex: 0 0 auto; padding: 10px 0 18px; background: linear-gradient(transparent, var(--bg) 30%); }
+  .composer { max-width: 760px; margin: 0 auto; padding: 0 20px; position: relative; }
+  .input-wrap {
+    display: flex; align-items: flex-end; gap: 8px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 10px 12px;
+  }
+  .input-wrap:focus-within { border-color: #565656; }
+  .input-wrap.dragover { border-color: var(--accent); background: #233b34; }
+  textarea {
+    flex: 1; background: none; border: none; outline: none; resize: none;
+    color: var(--text); font: inherit; line-height: 1.5; max-height: 180px; padding: 6px 4px;
+  }
+  .attach-btn { flex: 0 0 38px; width: 38px; height: 38px; border-radius: 50%; padding: 0; font-size: 17px; }
+  .mic-btn { flex: 0 0 38px; width: 38px; height: 38px; border-radius: 50%; padding: 0; font-size: 16px; }
+  .mic-btn.recording { background: var(--danger); border-color: var(--danger); animation: pulse 1.2s infinite; }
+  #pending { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 4px 8px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px;
+    background: #233b34; border: 1px solid #1f5b4a; color: #c9e8de; border-radius: 999px; padding: 4px 10px;
+  }
+  .chip.err { background: #3b2323; border-color: #5b1f1f; color: #f3c1c1; }
+  .chip .x { cursor: pointer; color: var(--muted); font-weight: 700; }
+  .chip img { width: 26px; height: 26px; object-fit: cover; border-radius: 6px; }
+  .hint { text-align: center; font-size: 11.5px; color: var(--muted); margin-top: 8px; }
+  .vision-note { font-size: 12.5px; color: #fbbf24; margin: 0 4px 8px; }
+  .vision-note button { padding: 2px 10px; font-size: 12px; margin-left: 6px; }
+  /* welcome */
+  .welcome { text-align: center; margin-top: 12vh; }
+  .welcome .logo { width: 54px; height: 54px; font-size: 26px; margin: 0 auto 14px; }
+  .welcome h1 { font-size: 26px; margin: 0 0 8px; }
+  .welcome p { color: var(--muted); margin: 0; }
+  .suggest { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin-top: 26px; }
+  .suggest button { border-radius: 12px; font-size: 13.5px; }
+  /* product gallery from IMAGES blocks */
+  .gallery { display: flex; flex-wrap: wrap; gap: 12px; margin: 10px 0 4px; }
+  .gallery figure { margin: 0; width: 128px; }
+  .gallery img {
+    width: 128px; height: 128px; object-fit: cover; border-radius: 10px;
+    border: 1px solid var(--border); background: #fff; display: block;
+  }
+  .gallery figcaption { font-size: 11.5px; color: var(--muted); margin-top: 4px; line-height: 1.3;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .gallery a { text-decoration: none; color: inherit; display: block; }
+  img.inline-img { max-width: 340px; max-height: 300px; border-radius: 10px; border: 1px solid var(--border); display: block; margin: 8px 0; background: #fff; }
+  /* ---------- live progress for long jobs ---------- */
+  .progress-line {
+    display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #9fd6c4;
+    background: #1c2a26; border: 1px solid #24503f; border-radius: 8px; padding: 6px 10px;
+  }
+  .progress-line .bar { flex: 1; height: 4px; border-radius: 4px; background: #2c3a36; overflow: hidden; }
+  .progress-line .bar i { display: block; height: 100%; width: 40%; background: var(--accent); animation: slide 1.6s infinite linear; }
+  @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+  /* ---------- side panel (memory / reminders / today) ---------- */
+  #panel {
+    position: fixed; top: 0; right: 0; bottom: 0; width: 430px; max-width: 92vw; z-index: 40;
+    background: var(--panel); border-left: 1px solid var(--border); display: none; flex-direction: column;
+    box-shadow: -20px 0 50px rgba(0,0,0,.45);
+  }
+  #panel .panel-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--border); font-weight: 600; }
+  #panel .panel-head button { padding: 4px 10px; }
+  #panelBody { flex: 1 1 auto; overflow-y: auto; padding: 14px 16px; }
+  .fact { display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 10px; margin-bottom: 8px; background: var(--card); font-size: 13.5px; }
+  .fact .fact-text { flex: 1; }
+  .fact button { padding: 2px 8px; font-size: 12px; color: var(--muted); }
+  .panel-add { display: flex; gap: 8px; margin: 12px 0 6px; }
+  .panel-add input, .panel-add select, .panel-add textarea {
+    flex: 1; background: var(--card); border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; color: var(--text); font: inherit; font-size: 13.5px;
+  }
+  .panel-row { display: flex; gap: 8px; margin-bottom: 8px; }
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+  .act { display: flex; gap: 8px; font-size: 13px; padding: 7px 2px; border-bottom: 1px solid #262626; }
+  .act .t { color: var(--muted); flex: 0 0 58px; }
+  .act.bad .s { color: #f3a1a1; }
+  .msg.reminder .avatar { background: radial-gradient(circle at 30% 30%, #f3c969, #b8860b 70%); }
+  .msg.reminder .body { border-left: 3px solid #f3c969; padding-left: 10px; }
+  /* mobile */
+  @media (max-width: 860px) {
+    #sidebar { position: fixed; z-index: 20; left: 0; top: 0; bottom: 0; transform: translateX(-100%); transition: transform .2s; }
+    #sidebar.open { transform: none; box-shadow: 0 0 40px rgba(0,0,0,.6); }
+    #menuBtn { display: inline-block !important; }
+  }
+  #menuBtn { display: none; }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="side-head">
+      <div class="brand"><div class="logo">J</div><div>Jarvis</div></div>
+      <span id="statusDot" class="status-dot"></span>
+    </div>
+    <button id="newChatBtn" class="primary">＋ New chat</button>
+    <div id="chatList"></div>
+    <div class="side-foot">Everything stays on this PC.</div>
+  </aside>
+
+  <div id="right">
+    <header>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <button id="menuBtn" title="Chats">☰</button>
+        <div class="brand" style="font-weight:600;"><div class="logo" style="width:26px;height:26px;font-size:13px;">J</div><div>Jarvis<span id="statusDot2" class="status-dot"></span></div></div>
+      </div>
+      <div class="actions">
+        <button id="memoryBtn" title="What Jarvis remembers about you">🧠 Memory</button>
+        <button id="remindersBtn" title="Your reminders">⏰ Reminders</button>
+        <button id="todayBtn" title="What Jarvis did today">📋 Today</button>
+        <button id="speakToggle" title="Read answers aloud">🔊 Speaker: off</button>
+      </div>
+    </header>
+
+    <main id="chat"><div class="col" id="thread"></div></main>
+
+    <footer>
+      <div class="composer">
+        <div id="pending"></div>
+        <div id="visionNote" class="vision-note" style="display:none;"></div>
+        <div class="input-wrap" id="dropZone">
+          <button id="attachBtn" class="attach-btn" title="Attach images, PDFs, documents">📎</button>
+          <button id="screenBtn" class="attach-btn" title="Use my screen — Jarvis looks at it and answers">🖥</button>
+          <textarea id="input" rows="1" placeholder="Message Jarvis…  (drag files here too)"></textarea>
+          <button id="micBtn" class="mic-btn" title="Voice input">🎙</button>
+          <button id="sendBtn" class="primary" title="Send">➤</button>
+        </div>
+        <div class="hint">Enter to send · Shift+Enter new line · 📎 attach · 🖥 ask about your screen · paper-trading only</div>
+      </div>
+    </footer>
+  </div>
+</div>
+<div id="panel">
+  <div class="panel-head"><span id="panelTitle">Panel</span><button id="panelClose" title="Close">✕</button></div>
+  <div id="panelBody"></div>
+</div>
+<input type="file" id="fileInput" multiple accept=".jpg,.jpeg,.png,.webp,.gif,.bmp,.pdf,.txt,.md,.csv,.json,.log,.yaml,.yml,.xml,.html,.js,.ts,.py,.css" style="display:none">
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const thread = $("thread"), input = $("input"), sendBtn = $("sendBtn"), micBtn = $("micBtn");
+  const statusDot = $("statusDot"), statusDot2 = $("statusDot2");
+  const pending = $("pending"), fileInput = $("fileInput"), visionNote = $("visionNote");
+  const screenBtn = $("screenBtn");
+  let busy = false, speakOn = false;
+  let pendingFiles = [];      // File objects chosen but not yet uploaded
+  let uploadInfo = null;      // server response: {saved, errors, visionNote, visionMissing}
+  let activeChatId = null;
+  let preAttached = null;     // "use my screen" result, waiting to be sent
+  let reminderCount = 0;
+
+  /* ---------- tiny helpers ---------- */
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  function scroll() { requestAnimationFrame(() => { $("chat").scrollTop = $("chat").scrollHeight; }); }
+  function setDot(state, which) {
+    const d = which || statusDot;
+    d.className = "status-dot" + (state === "bad" ? " bad" : state === "busy" ? " busy" : "");
+  }
+  function markdownLite(s) {
+    const d = document.createElement("div");
+    const parts = s.split(/(\*\*[^*]+\*\*|`[^`]+`|!\[[^\]]*\]\([^)]+\))/g);
+    for (const p of parts) {
+      if (/^\*\*[^*]+\*\*$/.test(p)) d.appendChild(el("b", "", p.slice(2, -2)));
+      else if (/^`[^`]+`$/.test(p)) d.appendChild(el("code", "", p.slice(1, -1)));
+      else if (/^!\[[^\]]*\]\(([^)]+)\)$/.test(p)) {
+        let url = p.slice(p.indexOf("](") + 2, -1);
+        // Models drop the local: prefix sometimes — any workspace-relative path is local.
+        if (url.startsWith("local:")) url = url.slice(6);
+        const src = /^(https?:)?\/\//i.test(url) || url.startsWith("/")
+          ? url
+          : "/api/serve-attachment?path=" + encodeURIComponent(url);
+        const img = el("img", "inline-img");
+        img.loading = "lazy";
+        img.src = src;
+        img.onerror = () => img.remove();
+        d.appendChild(img);
+      }
+      else d.appendChild(document.createTextNode(p));
+    }
+    return d;
+  }
+  /* ---------- product-image gallery ---------- */
+  function splitImagesBlock(text) {
+    // Also treat a bare IMAGES: block with attachment paths (no http) as gallery content.
+    const m = /\n?IMAGES:\n((?:PRODUCT:\s.*\nIMAGE_URL:\s.*\n?)+)\s*$/.exec(text);
+    if (!m) return { body: text, images: [] };
+    const images = [];
+    const re = /PRODUCT:\s([^\n]+)\nIMAGE_URL:\s([^\n]+)/g;
+    let mm;
+    while ((mm = re.exec(m[1]))) images.push({ name: mm[1].trim(), image: mm[2].trim() });
+    return { body: text.slice(0, m.index).replace(/\n+$/, ""), images };
+  }
+  function galleryEl(images) {
+    const g = el("div", "gallery");
+    for (const im of images) {
+      const a = el("a");
+      let target = im.image.startsWith("local:") ? im.image.slice(6) : im.image;
+      a.href = im.source || (/^(https?:)?\/\//i.test(target) ? target : "#");
+      a.target = "_blank";
+      a.rel = "noopener";
+      const fig = el("figure");
+      const img = el("img");
+      img.loading = "lazy";
+      img.src = /^(https?:)?\/\//i.test(target) ? target : "/api/serve-attachment?path=" + encodeURIComponent(target);
+      img.alt = im.name;
+      img.onerror = () => fig.remove();
+      fig.appendChild(img);
+      fig.appendChild(el("figcaption", "", im.name));
+      a.appendChild(fig);
+      g.appendChild(a);
+    }
+    return g;
+  }
+  function renderAnswer(container, text) {
+    const { body, images } = splitImagesBlock(text);
+    container.replaceChildren(markdownLite(body));
+    if (images.length) container.appendChild(galleryEl(images));
+  }
+
+  /* ---------- sidebar / chats ---------- */
+  async function refreshChats() {
+    try {
+      const r = await fetch("/api/chats");
+      const { chats, active } = await r.json();
+      activeChatId = active;
+      const list = $("chatList");
+      list.innerHTML = "";
+      for (const c of chats) {
+        const item = el("div", "chat-item" + (c.id === active ? " active" : ""));
+        item.appendChild(el("div", "t", c.title));
+        const del = el("button", "del", "✕");
+        del.title = "Delete this chat";
+        del.onclick = async (ev) => {
+          ev.stopPropagation();
+          if (!confirm("Delete this chat forever?")) return;
+          await fetch("/api/chats/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: c.id }) });
+          refreshChats(); loadHistory();
+        };
+        item.appendChild(del);
+        item.onclick = () => switchChat(c.id);
+        list.appendChild(item);
+      }
+    } catch { /* sidebar refresh is best-effort */ }
+  }
+
+  async function switchChat(id) {
+    if (busy || id === activeChatId) { $("sidebar").classList.remove("open"); return; }
+    const r = await fetch("/api/chats/switch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
+    const j = await r.json();
+    if (j.error) return;
+    renderMessages(j.messages || []);
+    $("sidebar").classList.remove("open");
+    refreshChats();
+  }
+
+  async function newChat() {
+    if (busy) return;
+    await fetch("/api/chats/new", { method: "POST" });
+    showWelcome();
+    refreshChats();
+    input.focus();
+  }
+  $("newChatBtn").onclick = newChat;
+  $("menuBtn").onclick = () => $("sidebar").classList.toggle("open");
+
+  /* ---------- status ---------- */
+  async function refreshStatus() {
+    try {
+      const r = await fetch("/api/status");
+      const s = await r.json();
+      const st = s.busy ? "busy" : s.brainOk ? "ok" : "bad";
+      setDot(st); setDot(st, statusDot2);
+      $("speakToggle").textContent = speakOn ? "🔊 Speaker: on" : "🔊 Speaker: off";
+      if (typeof s.memoryCount === "number") {
+        $("memoryBtn").textContent = s.memoryCount ? `🧠 Memory (${s.memoryCount})` : "🧠 Memory";
+      }
+    } catch { setDot("bad"); setDot("bad", statusDot2); }
+  }
+  setInterval(refreshStatus, 5000);
+  refreshStatus();
+
+  /* ---------- side panels: memory / reminders / today ---------- */
+  const panel = $("panel"), panelTitle = $("panelTitle"), panelBody = $("panelBody");
+  function openPanel(title) { panelTitle.textContent = title; panelBody.innerHTML = ""; panel.style.display = "flex"; }
+  $("panelClose").onclick = () => { panel.style.display = "none"; };
+  function muted(text, cls) { return el("div", "muted " + (cls || ""), text); }
+  async function postJSON(url, body) {
+    try {
+      const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+      return await r.json();
+    } catch (e) { return { error: String((e && e.message) || e) }; }
+  }
+
+  async function showMemoryPanel() {
+    openPanel("What Jarvis remembers about you");
+    const j = await (await fetch("/api/memory")).json();
+    const facts = j.facts || [];
+    if (!facts.length) panelBody.appendChild(muted("Nothing yet. Tell Jarvis something about you in a chat (\"remember, I study for CA Final\"), or add a fact below."));
+    for (const f of facts) {
+      const row = el("div", "fact");
+      row.appendChild(el("div", "fact-text", f.text + (f.addedAt ? `  (${f.addedAt})` : "")));
+      const x = el("button", "", "✕");
+      x.title = "Forget this";
+      x.onclick = async () => { await postJSON("/api/memory/delete", { text: f.text }); showMemoryPanel(); refreshStatus(); };
+      row.appendChild(x);
+      panelBody.appendChild(row);
+    }
+    const add = el("div", "panel-add");
+    const inp = el("input");
+    inp.placeholder = "Add something Jarvis should remember…";
+    const btn = el("button", "primary", "Save");
+    btn.onclick = async () => {
+      const t = inp.value.trim();
+      if (!t) return;
+      await postJSON("/api/memory/add", { text: t });
+      showMemoryPanel(); refreshStatus();
+    };
+    inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); btn.click(); } });
+    add.appendChild(inp); add.appendChild(btn);
+    panelBody.appendChild(add);
+    panelBody.appendChild(muted("Saved on this PC in " + (j.file || "data/memory/user.md") + " — you can open and edit that file by hand too.", "small"));
+  }
+  $("memoryBtn").onclick = showMemoryPanel;
+
+  async function showRemindersPanel() {
+    openPanel("Reminders");
+    const j = await (await fetch("/api/reminders")).json();
+    const items = j.upcoming || [];
+    if (!items.length) panelBody.appendChild(muted("Nothing scheduled. Add one below — Jarvis pops a Windows notification at the right time, even after a restart."));
+    for (const it of items) {
+      const row = el("div", "fact");
+      const txt = el("div", "fact-text");
+      txt.appendChild(el("div", "", it.text));
+      txt.appendChild(el("div", "muted small", new Date(it.dueAt).toLocaleString() + (it.repeat && it.repeat !== "none" ? ` · repeats ${it.repeat}` : "")));
+      row.appendChild(txt);
+      const x = el("button", "", "✕");
+      x.title = "Cancel this reminder";
+      x.onclick = async () => { await postJSON("/api/reminders/cancel", { id: it.id }); showRemindersPanel(); };
+      row.appendChild(x);
+      panelBody.appendChild(row);
+    }
+    panelBody.appendChild(muted("New reminder", "small"));
+    const text = el("input");
+    text.placeholder = "Remind me to…";
+    const row1 = el("div", "panel-add");
+    row1.appendChild(text);
+    panelBody.appendChild(row1);
+    const when = el("input");
+    when.type = "datetime-local";
+    const rep = el("select");
+    for (const opt of [["none", "just once"], ["daily", "every day"], ["weekdays", "weekdays"], ["weekly", "every week"]]) {
+      const o = el("option", "", opt[1]); o.value = opt[0]; rep.appendChild(o);
+    }
+    const btn = el("button", "primary", "Add");
+    btn.onclick = async () => {
+      if (!text.value.trim()) { alert("Type what to remind you about."); return; }
+      if (!when.value) { alert("Pick the date and time."); return; }
+      const res = await postJSON("/api/reminders/add", { text: text.value.trim(), when: when.value, repeat: rep.value });
+      if (res.error) { alert(res.error); return; }
+      showRemindersPanel();
+    };
+    const row2 = el("div", "panel-row");
+    row2.appendChild(when); row2.appendChild(rep); row2.appendChild(btn);
+    panelBody.appendChild(row2);
+    panelBody.appendChild(muted("You can also just ask in chat: \"remind me at 6pm to call the CA\".", "small"));
+  }
+  $("remindersBtn").onclick = showRemindersPanel;
+
+  async function showTodayPanel() {
+    openPanel("What Jarvis did today");
+    const j = await (await fetch("/api/activity")).json();
+    const entries = j.entries || [];
+    if (!entries.length) panelBody.appendChild(muted("Nothing recorded yet today."));
+    for (const e of entries.slice().reverse()) {
+      const row = el("div", "act" + (e.ok ? "" : " bad"));
+      row.appendChild(el("div", "t", new Date(e.at).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })));
+      row.appendChild(el("div", "s", e.summary + (e.ok ? "" : " (failed)")));
+      panelBody.appendChild(row);
+    }
+    panelBody.appendChild(muted("Every action Jarvis takes is logged here, newest first.", "small"));
+  }
+  $("todayBtn").onclick = showTodayPanel;
+
+  /* ---------- "use my screen": grab it and let Jarvis read it ---------- */
+  /* An image (screen, upload) can arrive before the vision model finished
+     reading it — poll until it is done instead of blocking the chat. */
+  const visionPollers = new Map();
+  function pollVision(imgPath, onReady) {
+    if (!imgPath || visionPollers.has(imgPath)) return;
+    let tries = 0;
+    const timer = setInterval(async () => {
+      tries++;
+      try {
+        const j = await (await fetch("/api/vision?path=" + encodeURIComponent(imgPath))).json();
+        if (j.text) {
+          clearInterval(timer); visionPollers.delete(imgPath); onReady(j.text, null); return;
+        }
+        if (j.error || tries > 40) {
+          clearInterval(timer); visionPollers.delete(imgPath); onReady(null, j.error || "timed out");
+        }
+      } catch { /* keep trying */ }
+    }, 4_000);
+    visionPollers.set(imgPath, timer);
+  }
+
+  async function useMyScreen() {
+    if (busy) return;
+    screenBtn.disabled = true;
+    const oldLabel = screenBtn.textContent;
+    screenBtn.textContent = "…";
+    try {
+      const j = await (await fetch("/api/screen", { method: "POST" })).json();
+      if (j.error) { alert("I couldn't capture your screen: " + j.error); return; }
+      preAttached = j;
+      const meta = Object.assign({}, j.saved[0], { _screen: true });
+      const chip = makeChip(meta, true);
+      const x = chip.querySelector(".x");
+      if (x) x.addEventListener("click", () => { preAttached = null; });
+      pending.appendChild(chip);
+      const showNote = (text) => {
+        visionNote.textContent = "👁 Jarvis can see your screen: " + text.slice(0, 260) + (text.length > 260 ? "…" : "");
+        visionNote.style.display = "block";
+      };
+      if (j.visionNote) {
+        showNote(j.visionNote);
+      } else {
+        visionNote.textContent = "👁 Reading your screen…";
+        visionNote.style.display = "block";
+        pollVision(meta.path, (text, err) => {
+          if (!text) { visionNote.textContent = "👁 I couldn't read your screen" + (err ? " (" + err + ")" : "."); return; }
+          if (preAttached && preAttached.saved && preAttached.saved[0]) {
+            preAttached.visionNote = text;
+            preAttached.attachmentContext = "[Attached image: " + meta.name + "]\n[Image content: " + text + "]";
+          }
+          showNote(text);
+        });
+      }
+      input.placeholder = "Ask about your screen…";
+      input.focus();
+    } finally {
+      screenBtn.disabled = false;
+      screenBtn.textContent = oldLabel;
+    }
+  }
+  screenBtn.onclick = useMyScreen;
+
+  /* ---------- reminder notes fired by the server ticker ---------- */
+  let lastReminderSeen = Date.now() - 60_000;
+  function addReminderNote(text) {
+    if (thread.querySelector(".welcome")) thread.innerHTML = "";
+    const m = el("div", "msg ai reminder");
+    m.appendChild(el("div", "avatar", "⏰"));
+    const b = el("div", "body");
+    b.appendChild(el("div", "meta", "Reminder"));
+    b.appendChild(markdownLite(text));
+    m.appendChild(b);
+    thread.appendChild(m);
+    scroll();
+  }
+  async function pollReminders() {
+    try {
+      const j = await (await fetch("/api/reminders")).json();
+      reminderCount = (j.upcoming || []).length;
+      $("remindersBtn").textContent = reminderCount ? `⏰ Reminders (${reminderCount})` : "⏰ Reminders";
+      const fresh = (j.fired || []).filter((f) => Date.parse(f.at) > lastReminderSeen);
+      if (fresh.length) {
+        lastReminderSeen = Date.now();
+        for (const f of fresh) { addReminderNote(f.text); maybeSpeak("Reminder: " + f.text); }
+      }
+    } catch { /* reminders are best-effort */ }
+  }
+  setInterval(pollReminders, 20_000);
+  pollReminders();
+
+  /* ---------- rendering ---------- */
+  function addUser(text, attachments) {
+    const m = el("div", "msg user");
+    m.appendChild(el("div", "avatar", "Y"));
+    const b = el("div", "body");
+    if (attachments && attachments.length) {
+      const row = el("div", "pending");
+      for (const a of attachments) row.appendChild(makeChip(a, false));
+      b.appendChild(row);
+    }
+    if (text) b.appendChild(document.createTextNode(text));
+    m.appendChild(b);
+    thread.appendChild(m);
+    scroll();
+  }
+  function makeChip(a, removable) {
+    const c = el("span", "chip" + (a.error ? " err" : ""));
+    if (a.kind === "image" && a.path) {
+      const img = el("img");
+      img.src = "/api/serve-attachment?path=" + encodeURIComponent(a.path);
+      c.appendChild(img);
+    }
+    c.appendChild(el("span", "", a.name || a.error));
+    if (removable) {
+      const x = el("span", "x", "✕");
+      x.onclick = () => { c.remove(); pendingFiles = pendingFiles.filter((f) => f._chip !== c); };
+      c.appendChild(x);
+    }
+    c._meta = a;
+    return c;
+  }
+  function addAi() {
+    const m = el("div", "msg ai");
+    m.appendChild(el("div", "avatar", "J"));
+    const body = el("div", "body");
+    const meta = el("div", "meta", "Jarvis");
+    const content = el("div", "content");
+    const tools = el("div", "tools");
+    m.appendChild(el("div"));
+    body.appendChild(meta); body.appendChild(tools); body.appendChild(content);
+    m.appendChild(body);
+    thread.appendChild(m);
+    scroll();
+    return { content, tools, meta };
+  }
+  function renderMessages(messages) {
+    thread.innerHTML = "";
+    if (!messages.length) { showWelcome(); return; }
+    for (const m of messages) {
+      if (m.role === "user") addUser(m.content);
+      else { const h = addAi(); renderAnswer(h.content, m.content); }
+    }
+    scroll();
+  }
+  function showWelcome() {
+    thread.innerHTML = "";
+    const w = el("div", "welcome");
+    const lg = el("div", "logo", "J");
+    const h = el("h1", "", "Hey, I'm Jarvis.");
+    const p = el("p", "", "Ask anything — research, code, run things on this PC, scan 1,225 NSE stocks. Attach images, PDFs or documents with 📎.");
+    const s = el("div", "suggest");
+    for (const q of ["What should I buy today?", "How did the strategy do last year?", "What's on my screen right now?"]) {
+      const b = el("button", "", q);
+      b.onclick = () => send(q);
+      s.appendChild(b);
+    }
+    w.appendChild(lg); w.appendChild(h); w.appendChild(p); w.appendChild(s);
+    thread.appendChild(w);
+  }
+
+  /* ---------- speak toggle ---------- */
+  $("speakToggle").onclick = () => {
+    speakOn = !speakOn;
+    $("speakToggle").textContent = speakOn ? "🔊 Speaker: on" : "🔊 Speaker: off";
+  };
+  function maybeSpeak(text) {
+    if (!speakOn || !("speechSynthesis" in window) || !text) return;
+    const u = new SpeechSynthesisUtterance(text.slice(0, 800));
+    u.rate = 1.02;
+    speechSynthesis.speak(u);
+  }
+
+  /* ---------- attachments ---------- */
+  $("attachBtn").onclick = () => fileInput.click();
+  fileInput.onchange = () => { addFiles([...fileInput.files]); fileInput.value = ""; };
+  const dz = $("dropZone");
+  ["dragenter", "dragover"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("dragover"); }));
+  ["dragleave", "drop"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("dragover"); }));
+  dz.addEventListener("drop", (e) => { if (e.dataTransfer?.files?.length) addFiles([...e.dataTransfer.files]); });
+
+  function addFiles(files) {
+    for (const f of files) {
+      if (pendingFiles.some((p) => p.name === f.name && p.size === f.size)) continue;
+      f._chip = makeChip({ name: f.name, kind: guessKind(f.name), path: "" }, true);
+      pending.appendChild(f._chip);
+      pendingFiles.push(f);
+    }
+    scroll();
+  }
+  function guessKind(name) {
+    return /\.(jpe?g|png|webp|gif|bmp)$/i.test(name) ? "image" : /\.(pdf)$/i.test(name) ? "pdf" : "text";
+  }
+
+  async function uploadPending() {
+    if (!pendingFiles.length) return null;
+    const fd = new FormData();
+    for (const f of pendingFiles) fd.append("files", f, f.name);
+    try {
+      const r = await fetch("/api/upload", { method: "POST", body: fd });
+      const j = await r.json();
+      uploadInfo = j;
+      // Images may still be "being read" by the vision model — let the user see
+      // what Jarvis ends up seeing, without ever blocking the send button.
+      if (j.visionPending) {
+        for (const s of j.saved || []) {
+          if (s.kind !== "image") continue;
+          pollVision(s.path, (text, err) => {
+            if (text) {
+              visionNote.textContent = "👁 Image read: " + text.slice(0, 220) + (text.length > 220 ? "…" : "");
+              visionNote.style.display = "block";
+            } else if (err) {
+              visionNote.textContent = "👁 I couldn't read the image (" + err + ").";
+              visionNote.style.display = "block";
+            }
+          });
+        }
+      }
+      return j;
+    } catch (e) {
+      return { saved: [], errors: ["upload failed: " + e.message], visionNote: null, visionMissing: false };
+    } finally {
+      pendingFiles = [];
+      pending.innerHTML = "";
+    }
+  }
+
+  function buildAttachmentContext(info) {
+    // Kept as a fallback for very old server responses; new servers send attachmentContext directly.
+    if (!info) return "";
+    if (info.attachmentContext) return info.attachmentContext;
+    const lines = [];
+    for (const s of info.saved || []) {
+      lines.push(`[Attached ${s.kind}: ${s.name}]`);
+    }
+    for (const err of info.errors || []) lines.push(`[Attachment failed: ${err}]`);
+    return lines.join("\n");
+  }
+
+  function showVisionOffer(info) {
+    if (!info || !info.visionMissing || !visionNote) return;
+    visionNote.innerHTML = "";
+    visionNote.appendChild(document.createTextNode(info.visionNote || "Images need a vision model."));
+    const btn = el("button", "", "Install vision model");
+    btn.onclick = () => send("Install a vision model so you can see my attached images (pick one that fits this PC, tell me the download size first)");
+    visionNote.appendChild(btn);
+    visionNote.style.display = "block";
+  }
+
+  /* ---------- send / stream ---------- */
+  let activeAbort = null; // aborts the SSE stream when you press Stop
+  function setBusy(b) {
+    busy = b;
+    sendBtn.disabled = false; // while busy the ➤ button becomes ⏹ Stop
+    sendBtn.textContent = b ? "⏹" : "➤";
+    sendBtn.title = b ? "Stop Jarvis" : "Send";
+    input.disabled = b;
+    setDot(b ? "busy" : "ok", statusDot2);
+    if (!b) input.focus();
+  }
+
+  async function stopJarvis() {
+    try { await fetch("/api/stop", { method: "POST" }); } catch {}
+    try { activeAbort?.abort(); } catch {}
+  }
+
+  async function send(text, attsOverride) {
+    text = (text ?? input.value).trim();
+    if ((!text && !pendingFiles.length && !preAttached) || busy) return;
+    if (thread.querySelector(".welcome")) thread.innerHTML = "";
+    const atts = attsOverride || [
+      ...(preAttached ? preAttached.saved : []),
+      ...pendingFiles.map((f) => f._chip?._meta).filter(Boolean),
+    ];
+    if (!attsOverride) {
+      addUser(text, atts);
+      input.value = "";
+    }
+    setBusy(true);
+    const screenContext = preAttached?.attachmentContext || "";
+    preAttached = null;
+
+    const uploadResult = attsOverride ? uploadInfo : await uploadPending();
+    // The server composes the context (names + extracted content + vision note).
+    const attachmentContext = [screenContext, uploadResult?.attachmentContext || ""].filter(Boolean).join("\n\n");
+    showVisionOffer(uploadResult);
+
+    const h = addAi();
+    const typing = el("div", "typing");
+    typing.innerHTML = "<span></span><span></span><span></span>";
+    h.content.appendChild(typing);
+    let acc = "", gotContent = false;
+
+    try {
+      activeAbort = new AbortController();
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, chatId: activeChatId, attachmentContext }),
+        signal: activeAbort.signal,
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(j.error || `HTTP ${res.status}`);
+      }
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n\n")) !== -1) {
+          const raw = buf.slice(0, i); buf = buf.slice(i + 2);
+          let event = "message", data = "";
+          for (const line of raw.split("\n")) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) data += line.slice(5).trim();
+          }
+          let payload;
+          try { payload = JSON.parse(data); } catch { continue; }
+
+          if (event === "content") {
+            if (!gotContent) { typing.remove(); gotContent = true; }
+            acc += payload.delta;
+            h.content.replaceChildren(h.tools, markdownLite(splitImagesBlock(acc).body), el("span", "cursor"));
+            scroll();
+          } else if (event === "tool_call") {
+            if (!gotContent) typing.remove();
+            const chip = el("div", "tool-chip");
+            chip.appendChild(el("span", "dot"));
+            chip.appendChild(el("code", "", `⚙ ${payload.name} ${JSON.stringify(payload.args).slice(0, 90)}`));
+            h.tools.appendChild(chip);
+            scroll();
+          } else if (event === "progress") {
+            // Live progress for long jobs (scans, backtests) — always visible so
+            // a 5-minute scan never looks stuck.
+            let line = h.tools.querySelector(".progress-line");
+            if (!line) {
+              line = el("div", "progress-line");
+              line.appendChild(el("span", "", ""));
+              const bar = el("span", "bar");
+              bar.appendChild(el("i"));
+              line.appendChild(bar);
+              h.tools.appendChild(line);
+            }
+            line.firstChild.textContent = "⏳ " + payload.message;
+            scroll();
+          } else if (event === "tool_result") {
+            const chip = h.tools.querySelector(".tool-chip:not(.ok):not(.fail)");
+            if (chip) {
+              chip.classList.add(payload.ok ? "ok" : "fail");
+              chip.appendChild(el("span", "", payload.ok ? "✓" : "✗"));
+              if (payload.excerpt) chip.appendChild(el("span", "", " " + payload.excerpt));
+            }
+            const doneLine = h.tools.querySelector(".progress-line");
+            if (doneLine) doneLine.remove();
+            scroll();
+          } else if (event === "approval_request") {
+            const card = el("div", "approval");
+            card.appendChild(el("div", "", "")).appendChild(el("b", "", `⚠ Approval needed — ${payload.action}`));
+            card.appendChild(el("div", "", payload.description));
+            const row = el("div", "row");
+            const yes = el("button", "primary", "Approve");
+            const no = el("button", "", "Deny");
+            row.appendChild(yes); row.appendChild(no);
+            card.appendChild(row);
+            h.tools.appendChild(card);
+            scroll();
+            yes.onclick = () => decide(true);
+            no.onclick = () => decide(false);
+            function decide(ok) {
+              yes.disabled = true; no.disabled = true;
+              fetch("/api/approve", { method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id: payload.id, decision: ok }) });
+              card.style.opacity = ".55";
+            }
+          } else if (event === "done") {
+            // Safety net: if the stream never carried the answer (error paths,
+            // older agents), show the one from the done event — never duplicate.
+            if (!acc.trim() && payload.answer && payload.answer.trim()) acc = payload.answer;
+            renderAnswer(h.content, acc);
+            // Collapse the tool chips into one quiet summary line.
+            const n = h.tools.querySelectorAll(".tool-chip").length;
+            if (n > 0) {
+              h.tools.replaceChildren(el("div", "tool-summary", `worked on it (${n} step${n === 1 ? "" : "s"})`));
+            }
+            maybeSpeak(splitImagesBlock(acc).body);
+          } else if (event === "error") {
+            typing.remove();
+            h.content.replaceChildren(markdownLite("⚠ " + payload.message));
+          }
+        }
+      }
+    } catch (e) {
+      typing.remove();
+      h.content.replaceChildren(markdownLite("⏹ " + (e.name === "AbortError" ? "Stopped — the scan/task was cancelled. Ask me something else, or say 'continue' to resume." : e.message)));
+    }
+    activeAbort = null;
+    if (!acc && !h.content.textContent.trim()) h.content.textContent = "(no answer)";
+    setBusy(false);
+    refreshChats();
+  }
+
+  /* ---------- composer events ---------- */
+  sendBtn.onclick = () => { if (busy) stopJarvis(); else send(); };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  input.addEventListener("input", () => {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 180) + "px";
+  });
+
+  /* ---------- voice input (browser mic → whisper.cpp server-side) ---------- */
+  let media = null, recorder = null, chunks = [];
+  micBtn.onclick = async () => {
+    if (recorder && recorder.state === "recording") { recorder.stop(); return; }
+    try {
+      media = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true } });
+    } catch { alert("Microphone unavailable — allow mic access in your browser."); return; }
+    const ctx = new AudioContext({ sampleRate: 16000 });
+    const src = ctx.createMediaStreamSource(media);
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    chunks = [];
+    proc.onaudioprocess = (e) => { if (recorder && recorder.state === "recording") chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    src.connect(proc); proc.connect(ctx.destination);
+    recorder = new MediaRecorder(media);
+    recorder.ondataavailable = () => {};
+    recorder.onstop = async () => {
+      micBtn.classList.remove("recording");
+      proc.disconnect(); src.disconnect(); ctx.close();
+      media.getTracks().forEach((t) => t.stop());
+      const total = chunks.reduce((a, c) => a + c.length, 0);
+      if (!total) { alert("No audio captured."); return; }
+      const pcm = new Int16Array(total);
+      let off = 0;
+      for (const c of chunks) { for (let i = 0; i < c.length; i++) { const s = Math.max(-1, Math.min(1, c[i])); pcm[off++] = s < 0 ? s * 0x8000 : s * 0x7FFF; } }
+      micBtn.disabled = true;
+      input.placeholder = "Transcribing…";
+      try {
+        const r = await fetch("/api/voice", { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: pcm.buffer });
+        const { text } = await r.json();
+        if (text) { input.value = text; send(); }
+        else alert("No speech detected.");
+      } catch (e) { alert("Transcription failed: " + e.message); }
+      micBtn.disabled = false;
+      input.placeholder = "Message Jarvis…";
+      input.focus();
+    };
+    micBtn.classList.add("recording");
+    recorder.start();
+  };
+
+  refreshChats();
+  loadHistory();
+  input.focus();
+
+  // Exposed for automated tests/debugging only.
+  window.__jarvis = { renderAnswer, splitImagesBlock };
+
+  async function loadHistory() {
+    try {
+      const r = await fetch("/api/history");
+      const { messages } = await r.json();
+      renderMessages(messages || []);
+    } catch { showWelcome(); }
+  }
+})();
+</script>
+</body>
+</html>

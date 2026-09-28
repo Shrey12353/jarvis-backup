@@ -1,0 +1,34 @@
+# AI Agent configuration — copy to config.yaml and edit.
+ollama:
+  host: http://localhost:11434
+  model: qwen2.5-coder:7b
+  temperature: 0.2
+  num_ctx: 8192
+
+agent:
+  max_steps: 12          # max tool round-trips per request
+  full_auto: false       # true = auto-approve "ask" tier tools (NOT dangerous ones)
+  allow_dangerous: false # true = even dangerous commands auto-run in full_auto. Very risky.
+  workspace: ""          # default working directory; empty = ~/jarvis-workspace
+                         # (kept outside this repo so the agent can't clobber its own code)
+
+voice:
+  wake_word: computer    # builtin: computer | jarvis | alexa | bumblebee | grasshopper ... or path to custom .ppn
+  access_key_env: PICOVOICE_ACCESS_KEY  # env var holding your free Picovoice AccessKey
+  stt:
+    # Local whisper.cpp command; {wav} is replaced with the recorded wav path.
+    # Install whisper.cpp (or whisper-cli) and a ggml model, e.g. base.en
+    command: ""
+    # Fallback STT when command is empty: vosk small model folder (e.g. models/vosk-model-small-en-us-0.15)
+    vosk_model: ""
+  tts:
+    engine: sapi         # sapi (Windows builtin, zero install) | say (macOS) | spd-say (Linux) | none
+    rate: 0
+  silence_threshold: 450 # RMS below this counts as silence
+  max_utterance_ms: 12000
+
+browser:
+  headless: false
+
+paths:
+  data: data             # sessions, screenshots, browser profile live here

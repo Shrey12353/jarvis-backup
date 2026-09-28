@@ -1,0 +1,33 @@
+{
+  "name": "jarvis-agent",
+  "version": "0.1.0",
+  "description": "Local, voice-controlled AI agent for your Windows PC: coding, git/github, vercel, supabase, browser automation, system control.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "chat": "tsx src/main.ts chat",
+    "ui": "tsx src/ui/server.ts",
+    "voice": "tsx src/main.ts voice",
+    "run": "tsx src/main.ts run",
+    "doctor": "tsx src/main.ts doctor",
+    "trade": "tsx src/trading/cli.ts",
+    "setup:browser": "playwright install chromium",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/unit.test.ts"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0",
+    "yaml": "^2.5.0"
+  },
+  "optionalDependencies": {
+    "@picovoice/porcupine-node": "^3.0.6",
+    "@picovoice/pvrecorder-node": "^1.2.9"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
