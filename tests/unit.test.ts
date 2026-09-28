@@ -824,14 +824,28 @@ test('parseWhen understands relative, clock and ISO times', () => {
   const hrs = parseWhen('in 2 hours', now)!;
   assert.equal(hrs.getHours(), 12);
   const clock = parseWhen('6:30pm', now)!;
-  assert.equal(clock.getHours(), 18);
-  assert.equal(clock.getMinutes(), 30);
+  // Stored instants are UTC; with the undetected offset (0) in tests the
+  // wall-clock digits land on the same UTC clock — zone-independent assert.
+  assert.equal(clock.getUTCHours(), 18);
+  assert.equal(clock.getUTCMinutes(), 30);
   const iso = parseWhen('2026-12-01T08:15', now)!;
-  assert.equal(iso.getFullYear(), 2026);
-  assert.equal(iso.getMonth(), 11);
-  assert.equal(iso.getHours(), 8);
+  // Naive digits round-trip through the explicit tz layer (offset 0 in tests):
+  // assert in UTC so the test is independent of the ambient machine zone.
+  assert.equal(iso.getUTCFullYear(), 2026);
+  assert.equal(iso.getUTCMonth(), 11);
+  assert.equal(iso.getUTCHours(), 8);
   assert.equal(parseWhen('sometime soon', now), null);
   assert.equal(parseWhen('', now), null);
+});
+
+test('explicit tz: naive wall-clock parses and formats in the detected zone', async () => {
+  const { formatDueLocal, localWallClockToUtc } = await import('../src/core/tz.js');
+  // Tests run with the undetected offset (0 = UTC): digits map to UTC.
+  const d = localWallClockToUtc('2026-12-01 08:15')!;
+  assert.equal(d.toISOString(), '2026-12-01T08:15:00.000Z');
+  assert.equal(localWallClockToUtc('garbage'), null);
+  assert.equal(formatDueLocal('2026-12-01T08:15:00Z'), 'Tue, 1 Dec, 8:15 AM');
+  assert.equal(formatDueLocal('not a date'), 'not a date');
 });
 
 test('reminders persist, fire once, repeat and cancel', async () => {
@@ -892,4 +906,20 @@ test('your own folders are readable, system paths are not', () => {
   assert.equal(path.normalize(expandHome('~/x')), path.join(home, 'x'));
   assert.ok(isInsideRoot(path.join(home, 'Downloads', 'a', 'b.txt'), path.join(home, 'Downloads')));
   assert.ok(!isInsideRoot(path.join(home, 'Downloads2', 'b.txt'), path.join(home, 'Downloads')));
+});
+
+test('free wake-word matcher: jarvis variants hit, other speech does not', async () => {
+  const { transcriptMatchesWakeWord, wordsAfterWakeWord } = await import('../src/voice/wake.js');
+  const hit = (t: string) => transcriptMatchesWakeWord(t, 'jarvis');
+  assert.ok(hit('jarvis')); // bare wake word
+  assert.ok(hit('hey jarvis')); // greeting prefix
+  assert.ok(hit('jarvis what is on my calendar today')); // command in same breath
+  assert.ok(hit('jervis')); // common mishearing
+  assert.ok(hit('hi jarvic')); // another variant
+  assert.ok(!hit('')); // silence
+  assert.ok(!hit('the weather is nice today')); // conversation, not the word
+  assert.ok(!hit('jazz')); // too short / wrong stem
+  assert.ok(!hit('traffic on the highway')); // 'jar'-ish but wrong
+  assert.deepEqual(wordsAfterWakeWord('jarvis what time is it', 'jarvis'), ['what', 'time', 'is', 'it']);
+  assert.deepEqual(wordsAfterWakeWord('jarvis', 'jarvis'), []);
 });

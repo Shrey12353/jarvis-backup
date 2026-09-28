@@ -260,7 +260,7 @@ async function doctor(cfg: AppConfig): Promise<void> {
   for (const k of ["GITHUB_TOKEN", "VERCEL_TOKEN", "SUPABASE_ACCESS_TOKEN"]) {
     console.log(`${k.padEnd(18)} ${process.env[k] ? "set" : "(optional, unset)"}`);
   }
-  console.log("\nVoice: wake word needs Porcupine + PICOVOICE_ACCESS_KEY; STT needs whisper.cpp or a vosk model; see README.");
+  console.log("\nVoice: STT via local whisper.cpp. Wake word: free local mode (say 'Jarvis') — no key needed. Optional Picovoice: set PICOVOICE_ACCESS_KEY.");
 }
 
 main().catch((e) => {

@@ -7,6 +7,7 @@
  */
 import { promises as fsp } from "node:fs";
 import path from "node:path";
+import { formatDueLocal, localWallClockToUtc, tzOffsetMinutes } from "./tz.js";
 
 export type Repeat = "none" | "daily" | "weekdays" | "weekly";
 
@@ -110,14 +111,21 @@ export function parseWhen(input: string, now: Date = new Date()): Date | null {
     const ap = (clock[3] ?? "").toLowerCase();
     if (ap === "pm" && h < 12) h += 12;
     if (ap === "am" && h === 12) h = 0;
-    const d = new Date(now);
-    d.setHours(h, min, 0, 0);
-    if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1); // "9am" said at noon = tomorrow
+    // Wall-clock digits are in the USER's real zone (Node's ambient zone
+    // resolves to UTC on this PC) — build the instant via the explicit offset.
+    const localNow = new Date(now.getTime() + tzOffsetMinutes * 60_000);
+    let d = new Date(
+      Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth(), localNow.getUTCDate(), h, min, 0) -
+        tzOffsetMinutes * 60_000,
+    );
+    if (d.getTime() <= now.getTime()) d = new Date(d.getTime() + 86_400_000); // "9am" said at noon = tomorrow
     return d;
   }
   const iso = /^(\d{4})-(\d{2})-(\d{2})([T ]\d{2}:\d{2}(:\d{2})?)?/.exec(s);
   if (iso) {
-    const d = new Date(s.replace(" ", "T"));
+    // Naive date-time (no zone): the digits are in the USER's local clock,
+    // which on this PC differs from Node's "local" zone — resolve explicitly.
+    const d = localWallClockToUtc(s) ?? new Date(s.replace(" ", "T"));
     if (!isNaN(d.getTime())) return d;
   }
   const fallback = new Date(s);
@@ -125,15 +133,9 @@ export function parseWhen(input: string, now: Date = new Date()): Date | null {
 }
 
 export function formatDue(iso: string): string {
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, {
-    weekday: "short",
-    day: "numeric",
-    month: "short",
-    hour: "numeric",
-    minute: "2-digit",
-  });
+  // Explicit user-local formatting — Node's ambient zone resolves to UTC on
+  // this machine, which made every toast show times 5.5h off (IST).
+  return formatDueLocal(iso);
 }
 
 // ================= store operations =================

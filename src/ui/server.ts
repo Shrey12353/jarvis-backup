@@ -26,6 +26,8 @@ import { logActivity, pruneActivity, readActivity, summarizeToolCall } from "../
 import { describeOrWait, visionCached } from "../core/vision.js";
 import { captureScreen } from "../core/pc.js";
 import { showNotification } from "../core/notify.js";
+import { detectTimezone } from "../core/tz.js";
+import { startTelegramBot, pushReminder, readOwnerChatId } from "../core/telegram.js";
 import { buildRegistry } from "../index.js";
 import { shutdownBrowser } from "../tools/browser.js";
 import { transcribe } from "../voice/stt.js";
@@ -95,6 +97,12 @@ async function main(): Promise<void> {
   await ensureChatsDir(cfg.paths.data);
   await migrateLegacySession(cfg.paths.data);
   initLogging(cfg.paths.data);
+  // Detect the user's REAL local timezone once (Node's ambient zone resolves
+  // to UTC on this Windows setup, which made reminder toasts show UTC times).
+  const tzMin = await detectTimezone();
+  console.log(
+    `[jarvis] local timezone: UTC${tzMin >= 0 ? "+" : "-"}${String(Math.floor(Math.abs(tzMin) / 60)).padStart(2, "0")}:${String(Math.abs(tzMin) % 60).padStart(2, "0")}`,
+  );
   void pruneActivity(cfg.paths.data); // keep the activity log folder small
 
   // Jarvis runs all day (auto-started, hidden) and owns the reminders, so an
@@ -158,6 +166,24 @@ async function main(): Promise<void> {
       await agent.reset(); // fresh chat: write system prompt
     }
     return agent;
+  }
+
+  // Telegram bot (optional): set TELEGRAM_BOT_TOKEN in .env to enable. The
+  // phone gets its own chat session and shares the same brain, tools and
+  // approval rules; fired reminders are pushed to the owner's phone too.
+  const tgToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  if (tgToken) {
+    const botAgent = async () => {
+      const botChatPath = chatFilePath(cfg.paths.data, "telegram-bot");
+      const agent = new Agent(cfg, registry, botChatPath, { dataDir: cfg.paths.data });
+      if (await loadChat(cfg.paths.data, "telegram-bot")) {
+        await agent.loadSession();
+      } else {
+        await agent.reset();
+      }
+      return agent;
+    };
+    void startTelegramBot({ token: tgToken, makeAgent: botAgent, dataDir: cfg.paths.data, log });
   }
 
   async function handleChat(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -653,6 +679,12 @@ async function main(): Promise<void> {
     try {
       for (const r of await dueReminders(cfg.paths.data)) {
         await showNotification(r.text, "Jarvis reminder");
+        // Mirror the reminder to the owner's phone when Telegram is linked.
+        const tgToken2 = process.env.TELEGRAM_BOT_TOKEN?.trim();
+        if (tgToken2) {
+          const owner = await readOwnerChatId(cfg.paths.data);
+          if (owner) void pushReminder(tgToken2, owner, r.text);
+        }
         await markFired(cfg.paths.data, r.id);
         await logActivity(cfg.paths.data, "reminder", `reminded you: ${r.text}`, true);
         console.log(`[jarvis] reminder fired: ${r.text}`);

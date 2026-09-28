@@ -90,6 +90,8 @@ export function summarizeToolCall(name: string, args: Record<string, unknown> = 
       return `backtested the ${a("strategy") || "default"} strategy`;
     case "trade_engine":
       return "ran the paper-trading engine";
+    case "calendar_today":
+      return "checked today's calendar";
     case "ollama_chat":
       return "asked the local model a quick question";
     case "ollama_pull":

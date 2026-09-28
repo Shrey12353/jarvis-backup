@@ -101,6 +101,7 @@ function compactSystemPrompt(raw: string): string {
   const digest = [
     line(/- ATTACHED FILES:[^\n]*/),
     line(/- EMAIL:[^\n]*/),
+    line(/- CALENDAR:[^\n]*/),
     line(/- STAY IN YOUR LANE[^\n]*/),
     line(/- DESTRUCTIVE = ASK FIRST[^\n]*/),
     line(/- PRIVACY:[^\n]*/),

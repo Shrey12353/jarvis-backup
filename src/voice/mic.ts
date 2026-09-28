@@ -3,6 +3,8 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { nowStamp } from "../core/util.js";
 import type { VoiceConfig } from "../core/config.js";
+import { transcribe } from "./stt.js";
+import { transcriptMatchesWakeWord, wordsAfterWakeWord, WAKE_WINDOW_MS, WAKE_GAP_MS } from "./wake.js";
 
 /* Picovoice modules are optional native deps, loaded lazily so the rest of the
    agent works without them. */
@@ -397,4 +399,143 @@ export async function recordUtterance(cfg: VoiceConfig, outDir: string): Promise
   const file = path.join(outDir, `utterance-${nowStamp()}.wav`);
   await writeWav(file, Int16Array.from(pcm), sampleRate);
   return file;
+}
+
+/**
+ * Wake-gated always-listen session — the free "Hey Jarvis".
+ *
+ * Same mic + loudness VAD as startFreeListening, but each short speech
+ * candidate is transcribed by whisper LOCALLY and only counts as a wake when
+ * the wake word ("jarvis") appears. The command can ride the same breath
+ * (words after the wake word are forwarded) or arrive in the next utterance.
+ * If the wake word is heard but nothing follows, a chime-like prompt plays.
+ */
+export function startWakeListening(
+  cfg: VoiceConfig,
+  dataDir: string,
+  onCommand: (payload: { wav: string | null; text: string; awaitMore: boolean }) => void,
+): VoiceSession {
+  if (!PvRecorder) throw new Error("PvRecorder not installed (npm i @picovoice/pvrecorder-node)");
+  const frameLength = 512;
+  const sampleRate = 16_000;
+  const recorder = new PvRecorder(frameLength, -1);
+  recorder.start();
+  const outDir = path.join(dataDir, "voice");
+
+  const frameMs = (frameLength / sampleRate) * 1000;
+  const leadFrames = Math.round(400 / frameMs);
+  const silenceLimitFrames = Math.round(WAKE_GAP_MS / frameMs);
+  const maxFrames = Math.round(WAKE_WINDOW_MS / frameMs);
+
+  let stopped = false;
+  let paused = false;
+  let capturing = false;
+  let speechStarted = false;
+  let loudRun = 0;
+  let silentFrames = 0;
+  let frames = 0;
+  let pcm: number[] = [];
+  let armed = false; // wake word heard — the NEXT utterance is a command
+
+  const finish = async (): Promise<void> => {
+    capturing = false;
+    speechStarted = false;
+    silentFrames = 0;
+    loudRun = 0;
+    frames = 0;
+    const captured = pcm;
+    pcm = [];
+    if (!speechStarted || captured.length < sampleRate / 2) return;
+    try {
+      await fs.mkdir(outDir, { recursive: true });
+      const file = path.join(outDir, `wake-${nowStamp()}.wav`);
+      await writeWav(file, Int16Array.from(captured), sampleRate);
+      if (armed) {
+        // The wake word was heard earlier — this utterance IS the command.
+        armed = false;
+        let text = "";
+        try {
+          text = (await transcribe(file, cfg)).trim();
+        } catch {
+          text = "";
+        }
+        onCommand({ wav: file, text, awaitMore: false });
+        return;
+      }
+      let text = "";
+      try {
+        text = (await transcribe(file, cfg)).toLowerCase();
+      } catch {
+        text = ""; // a failed check must never crash the loop
+      }
+      if (transcriptMatchesWakeWord(text, cfg.wake_word)) {
+        const followUp = wordsAfterWakeWord(text, cfg.wake_word);
+        if (followUp.length) {
+          onCommand({ wav: null, text: followUp.join(" "), awaitMore: false });
+        } else {
+          armed = true; // bare wake — the next utterance is the command
+          onCommand({ wav: null, text: "", awaitMore: true });
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+
+  void (async () => {
+    while (!stopped) {
+      const chunk = flattenChunk(await recorder.read());
+      if (paused) continue;
+      for (let i = 0; i < chunk.length; i++) pcm.push(chunk[i]);
+      frames += chunk.length;
+      const tail = pcm.slice(-Math.min(pcm.length, frameLength * 8));
+      const level = rms(tail);
+
+      if (!capturing) {
+        if (level > cfg.silence_threshold) {
+          if (++loudRun >= Math.round(leadFrames / chunk.length)) {
+            capturing = true;
+            speechStarted = true;
+            silentFrames = 0;
+            frames = 0;
+            pcm = pcm.slice(-frameLength * 4);
+          }
+        } else {
+          loudRun = 0;
+          if (pcm.length > frameLength * 20) pcm = pcm.slice(-frameLength * 4);
+        }
+        continue;
+      }
+
+      if (level >= cfg.silence_threshold) {
+        silentFrames = 0;
+      } else {
+        silentFrames += chunk.length;
+      }
+      if (silentFrames > silenceLimitFrames || frames > maxFrames) await finish();
+    }
+  })().catch(() => {});
+
+  return {
+    onUtterance: (_w: string | null) => {}, // interface shim — commands flow via onCommand
+    setPaused(p: boolean) {
+      paused = p;
+      if (p) {
+        capturing = false;
+        speechStarted = false;
+        pcm = [];
+        frames = 0;
+        loudRun = 0;
+      }
+    },
+    async stop() {
+      stopped = true;
+      try {
+        recorder.stop();
+        recorder.release();
+      } catch {
+        /* ignore */
+     }
+    },
+  };
 }

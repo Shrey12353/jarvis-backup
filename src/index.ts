@@ -9,6 +9,7 @@ import { vscodeTools } from "./tools/vscode.js";
 import { systemTools } from "./tools/system.js";
 import { webTools } from "./tools/web.js";
 import { gmailTools } from "./tools/gmail.js";
+import { calendarTools } from "./tools/calendar.js";
 import { imageGenTools } from "./tools/imagegen.js";
 import { tradingTools } from "./tools/trading.js";
 import { aiTools } from "./tools/ai.js";
@@ -29,6 +30,7 @@ export function buildRegistry(): RegistryType {
     systemTools,
     webTools,
     gmailTools,
+    calendarTools,
     imageGenTools,
     tradingTools,
     aiTools,

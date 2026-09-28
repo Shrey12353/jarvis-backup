@@ -1,7 +1,7 @@
 import readline from "node:readline";
 import { Agent } from "../core/agent.js";
 import type { AppConfig } from "../core/config.js";
-import { startVoiceSession, startFreeListening, recordUtterance, wakeWordAvailable } from "./mic.js";
+import { startVoiceSession, startFreeListening, startWakeListening, recordUtterance, wakeWordAvailable } from "./mic.js";
 import { transcribe } from "./stt.js";
 import { speak } from "./tts.js";
 
@@ -58,21 +58,33 @@ export async function voiceLoop(cfg: AppConfig, agent: Agent): Promise<void> {
   };
 
   if (!wakeWordAvailable()) {
-    say("🎧 Hands-free mode (no wake-word key needed) — just START SPEAKING and he listens.");
-    say("   Wait for his spoken answer, then speak your next command.");
+    // Free wake-word mode: whisper locally checks every short speech clip for
+    // the wake word ("jarvis"). Nothing is sent anywhere and no key is needed.
+    say("🎧 Wake-word mode (free, local): say \"Jarvis\" — then speak your command.");
+    say("   Example: \"Jarvis, what's on my calendar today?\"");
     say("   You can also TYPE a command. Type 'exit' to quit.\n");
-    say("   Listening…");
+    say("   Listening for the wake word…");
     let busy = false;
-    const session = startFreeListening(cfg.voice, cfg.paths.data, (wav) => {
+    const session = startWakeListening(cfg.voice, cfg.paths.data, (p) => {
       if (busy || exiting) return;
+      if (p.awaitMore) {
+        say("🔔 I'm listening — go ahead.");
+        void speak("I'm listening", cfg.voice).catch(() => {});
+        return;
+      }
+      if (!p.wav && !p.text) return; // spurious empty event
       busy = true;
       session.setPaused(true);
-      void handleUtterance(wav)
-        .finally(() => {
-          busy = false;
-          session.setPaused(false);
-          say("…listening — speak when ready");
-        });
+      const runIt = p.text
+        ? runAgentTurn(agent, cfg, p.text, confirm).catch((e) =>
+            say(`Voice error: ${e instanceof Error ? e.message : String(e)}`),
+          )
+        : handleUtterance(p.wav); // text-less wav: full pipeline inside
+      void runIt.finally(() => {
+        busy = false;
+        session.setPaused(false);
+        say("…listening for the wake word again");
+      });
     });
     // Typed commands still work while idle.
     for (;;) {
