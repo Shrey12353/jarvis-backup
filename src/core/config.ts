@@ -146,6 +146,7 @@ export async function loadConfig(cwd = process.cwd()): Promise<AppConfig> {
   if (cfg.cloud_backup) {
     if (process.env.JARVIS_BACKUP_BASE_URL) cfg.cloud_backup.base_url = process.env.JARVIS_BACKUP_BASE_URL;
     if (process.env.JARVIS_BACKUP_MODEL) cfg.cloud_backup.model = process.env.JARVIS_BACKUP_MODEL;
+    if (process.env.JARVIS_BACKUP_API_KEY) cfg.cloud_backup.api_key = process.env.JARVIS_BACKUP_API_KEY;
     if (process.env.JARVIS_OPENROUTER_API_KEY) cfg.cloud_backup.api_key = process.env.JARVIS_OPENROUTER_API_KEY;
     if (process.env.JARVIS_BACKUP_OFF) cfg.cloud_backup.enabled = false;
   }
