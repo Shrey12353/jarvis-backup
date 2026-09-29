@@ -6,10 +6,8 @@ echo  ============================================
 echo   JARVIS - voice mode
 echo  ============================================
 echo.
-echo  Say "Jarvis" then speak your command. Answer spoken back.
+echo  Say "Jarvis" — wait for "I'm listening" — then speak your command.
+echo  Or in one breath: "Jarvis, what's on my calendar today?"
 echo  You can also TYPE a command and press Enter instead of speaking.
 echo  Type exit and press Enter to quit.
-echo.
-echo  No wake-word key yet? Press Enter, speak, press Enter (push-to-talk).
-echo.
 cmd /k npm run voice

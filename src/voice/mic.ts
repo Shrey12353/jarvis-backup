@@ -3,6 +3,8 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { nowStamp } from "../core/util.js";
 import type { VoiceConfig } from "../core/config.js";
+import { rms } from "./level.js";
+import { SpeechCapture } from "./capture.js";
 import { transcribe } from "./stt.js";
 import { transcriptMatchesWakeWord, wordsAfterWakeWord, WAKE_WINDOW_MS, WAKE_GAP_MS } from "./wake.js";
 
@@ -18,7 +20,7 @@ interface PorcupineLike {
 interface PvRecorderLike {
   start(): void;
   stop(): void;
-  read(): Promise<Int16Array[]>;
+  read(): Promise<unknown>;
   release(): void;
   isRecording(): boolean;
 }
@@ -63,7 +65,10 @@ function flattenChunk(chunk: unknown): Int16Array {
     for (const f of parts) len += f.length;
     const out = new Int16Array(len);
     let o = 0;
-    for (const f of parts) { out.set(f, o); o += f.length; }
+    for (const f of parts) {
+      out.set(f, o);
+      o += f.length;
+    }
     return out;
   }
   return chunk as Int16Array;
@@ -78,15 +83,11 @@ function resolveKeyword(word: string): string | Buffer {
   const key = word.toUpperCase();
   if (BuiltinKeyword && key in BuiltinKeyword) return BuiltinKeyword[key];
   throw new Error(
-    `Unknown wake word "${word}". Builtin options: ${BuiltinKeyword ? Object.keys(BuiltinKeyword).join(", ").toLowerCase() : "(module missing)"} — or pass a path to a custom .ppn`
+    `Unknown wake word "${word}". Builtin options: ${BuiltinKeyword ? Object.keys(BuiltinKeyword).join(", ").toLowerCase() : "(module missing)"} — or pass a path to a custom .ppn`,
   );
 }
 
-/**
- * A single voice session owns ONE microphone handle. The same recorder feeds
- * wake-word detection and utterance capture — no second mic open, which is
- * what breaks voice mode on Windows if done naively.
- */
+/** A voice session owns ONE microphone handle. */
 export interface VoiceSession {
   /** Called with a WAV path after each wake+utterance, or null if nothing heard. */
   onUtterance: (wavPath: string | null) => void;
@@ -95,6 +96,22 @@ export interface VoiceSession {
   stop(): Promise<void>;
 }
 
+async function saveWav(outDir: string, name: string, samples: number[], sampleRate: number): Promise<string | null> {
+  try {
+    await fs.mkdir(outDir, { recursive: true });
+    const file = path.join(outDir, `${name}-${nowStamp()}.wav`);
+    await writeWav(file, Int16Array.from(samples), sampleRate);
+    return file;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Porcupine wake-word session (used when a Picovoice AccessKey is configured).
+ * The engine detects the wake word on-device; the utterance after it is
+ * captured with the shared, sample-correct capture engine.
+ */
 export function startVoiceSession(cfg: VoiceConfig, dataDir: string, onUtterance: (wav: string | null) => void): VoiceSession {
   if (!Porcupine || !PvRecorder) {
     throw new Error("Porcupine modules not installed (npm i @picovoice/porcupine-node @picovoice/pvrecorder-node)");
@@ -111,39 +128,24 @@ export function startVoiceSession(cfg: VoiceConfig, dataDir: string, onUtterance
   recorder.start();
 
   const outDir = path.join(dataDir, "voice");
-
-  const frameMs = (frameLen / sampleRate) * 1000;
-  const silenceLimitFrames = Math.round(1200 / frameMs);
-  const maxFrames = Math.round(cfg.max_utterance_ms / frameMs);
-  const noSpeechLimitFrames = Math.round(3000 / frameMs);
+  // After the wake word: capture up to the configured max, ending on ~1.2s of
+  // silence. All limits are in SAMPLES via the shared engine.
+  const capture = new SpeechCapture({
+    sampleRate,
+    threshold: cfg.silence_threshold,
+    leadMs: 150,
+    endSilenceMs: 1200,
+    maxMs: cfg.max_utterance_ms,
+    prerollMs: 250,
+  });
 
   let stopped = false;
   let paused = false;
-  let capturing = false;
-  let speechStarted = false;
-  let silentFrames = 0;
-  let frames = 0;
-  let pcm: number[] = [];
+  let armed = false;
 
-  const finishCapture = async (): Promise<void> => {
-    capturing = false;
-    speechStarted = false;
-    silentFrames = 0;
-    frames = 0;
-    const captured = pcm;
-    pcm = [];
-    if (!captured.length || captured.length < sampleRate / 2) {
-      onUtterance(null);
-      return;
-    }
-    try {
-      await fs.mkdir(outDir, { recursive: true });
-      const file = path.join(outDir, `utterance-${nowStamp()}.wav`);
-      await writeWav(file, Int16Array.from(captured), sampleRate);
-      onUtterance(file);
-    } catch {
-      onUtterance(null);
-    }
+  const finish = async (clip: number[]): Promise<void> => {
+    const file = await saveWav(outDir, "utterance", clip, sampleRate);
+    onUtterance(file);
   };
 
   void (async () => {
@@ -151,38 +153,21 @@ export function startVoiceSession(cfg: VoiceConfig, dataDir: string, onUtterance
       const chunk = flattenChunk(await recorder.read());
       if (paused) continue;
 
-      if (!capturing) {
+      if (!armed) {
         const idx = pp.process([chunk]);
         if (idx !== -1) {
-          capturing = true;
-          speechStarted = false;
-          silentFrames = 0;
-          frames = 0;
-          pcm = [];
+          armed = true;
+          // Start capture immediately with a preroll; the wake word itself was
+          // just spoken, so lead-time is already satisfied.
+          capture.feed(chunk);
         }
         continue;
       }
 
-      // capturing an utterance
-      for (let i = 0; i < chunk.length; i++) pcm.push(chunk[i]);
-      frames += 1;
-      const tail = pcm.slice(-Math.min(pcm.length, frameLen * 8));
-      const level = rms(tail);
-      if (!speechStarted && level > cfg.silence_threshold) speechStarted = true;
-
-      if (speechStarted) {
-        if (level < cfg.silence_threshold) {
-          silentFrames += chunk.length;
-          if (silentFrames > silenceLimitFrames || frames > maxFrames) {
-            await finishCapture();
-          }
-        } else {
-          silentFrames = 0;
-          if (frames > maxFrames) await finishCapture();
-        }
-      } else if (frames > noSpeechLimitFrames) {
-        // woke but nobody spoke
-        await finishCapture();
+      const ev = capture.feed(chunk);
+      if (ev?.kind === "clip") await finish(ev.samples);
+      else if (ev?.kind === "giveUp") {
+        armed = false; // woke but nobody spoke — listen for the wake word again
       }
     }
   })().catch(() => {});
@@ -196,7 +181,7 @@ export function startVoiceSession(cfg: VoiceConfig, dataDir: string, onUtterance
       stopped = true;
       try {
         recorder.stop();
-        recorder.release(); // this build exposes release(), not delete()
+        recorder.release();
       } catch {
         /* ignore */
       }
@@ -209,42 +194,10 @@ export function startVoiceSession(cfg: VoiceConfig, dataDir: string, onUtterance
   };
 }
 
-function rms(buf: number[]): number {
-  let sum = 0;
-  const step = Math.max(1, Math.floor(buf.length / 2000));
-  let n = 0;
-  for (let i = 0; i < buf.length; i += step) {
-    sum += buf[i] * buf[i];
-    n++;
-  }
-  return n ? Math.sqrt(sum / n) : 0;
-}
-
-/** Minimal 16-bit mono WAV writer (used by both session and push-to-talk). */
-export async function writeWav(file: string, samples: Int16Array, sampleRate: number): Promise<void> {
-  const dataLen = samples.length * 2;
-  const buf = Buffer.alloc(44 + dataLen);
-  buf.write("RIFF", 0);
-  buf.writeUInt32LE(36 + dataLen, 4);
-  buf.write("WAVE", 8);
-  buf.write("fmt ", 12);
-  buf.writeUInt32LE(16, 16);
-  buf.writeUInt16LE(1, 20);
-  buf.writeUInt16LE(1, 22);
-  buf.writeUInt32LE(sampleRate, 24);
-  buf.writeUInt32LE(sampleRate * 2, 28);
-  buf.writeUInt16LE(2, 32);
-  buf.writeUInt16LE(16, 34);
-  buf.write("data", 36);
-  buf.writeUInt32LE(dataLen, 40);
-  for (let i = 0; i < samples.length; i++) buf.writeInt16LE(samples[i], 44 + i * 2);
-  await fs.writeFile(file, buf);
-}
-
 /**
- * Hands-free listening WITHOUT any wake-word key: a voice-activity listener
- * that wakes on any sustained speech (no keyword needed), captures the
- * utterance, and reports it. Same session shape as startVoiceSession.
+ * Always-listen session (no wake word): every speech clip goes straight to the
+ * handler. Used before — kept for compatibility — but voice mode now prefers
+ * startWakeListening, which gates on the wake word locally.
  */
 export function startFreeListening(cfg: VoiceConfig, dataDir: string, onUtterance: (wav: string | null) => void): VoiceSession {
   if (!PvRecorder) throw new Error("PvRecorder not installed (npm i @picovoice/pvrecorder-node)");
@@ -254,76 +207,28 @@ export function startFreeListening(cfg: VoiceConfig, dataDir: string, onUtteranc
   recorder.start();
   const outDir = path.join(dataDir, "voice");
 
-  const frameMs = (frameLength / sampleRate) * 1000;
-  const silenceLimitFrames = Math.round(1400 / frameMs);
-  const maxFrames = Math.round(cfg.max_utterance_ms / frameMs);
-  const leadFrames = Math.round(400 / frameMs); // sustained loudness before we call it speech
-  const gapFrames = Math.round(700 / frameMs); // max silence mid-speech before we cut
+  const capture = new SpeechCapture({
+    sampleRate,
+    threshold: cfg.silence_threshold,
+    leadMs: 400,
+    endSilenceMs: 1400,
+    maxMs: cfg.max_utterance_ms,
+    prerollMs: 400,
+  });
 
   let stopped = false;
   let paused = false;
-  let capturing = false;
-  let speechStarted = false;
-  let loudRun = 0;
-  let silentFrames = 0;
-  let frames = 0;
-  let pcm: number[] = [];
-
-  const finish = async (): Promise<void> => {
-    capturing = false;
-    speechStarted = false;
-    silentFrames = 0;
-    loudRun = 0;
-    frames = 0;
-    const captured = pcm;
-    pcm = [];
-    if (!speechStarted || captured.length < sampleRate / 2) {
-      onUtterance(null);
-      return;
-    }
-    try {
-      await fs.mkdir(outDir, { recursive: true });
-      const file = path.join(outDir, `utterance-${nowStamp()}.wav`);
-      await writeWav(file, Int16Array.from(captured), sampleRate);
-      onUtterance(file);
-    } catch {
-      onUtterance(null);
-    }
-  };
 
   void (async () => {
     while (!stopped) {
       const chunk = flattenChunk(await recorder.read());
       if (paused) continue;
-      for (let i = 0; i < chunk.length; i++) pcm.push(chunk[i]);
-      frames += chunk.length;
-      const tail = pcm.slice(-Math.min(pcm.length, frameLength * 8));
-      const level = rms(tail);
-
-      if (!capturing) {
-        // Idle: wait for sustained loudness — a door slam shouldn't wake him.
-        if (level > cfg.silence_threshold) {
-          if (++loudRun >= Math.round(leadFrames / chunk.length)) {
-            capturing = true;
-            speechStarted = true;
-            silentFrames = 0;
-            frames = 0;
-            pcm = pcm.slice(-frameLength * 4); // small pre-roll so first words survive
-          }
-        } else {
-          loudRun = 0;
-          if (pcm.length > frameLength * 20) pcm = pcm.slice(-frameLength * 4);
-        }
-        continue;
-      }
-
-      if (level >= cfg.silence_threshold) {
-        silentFrames = 0;
-      } else {
-        silentFrames += chunk.length;
-      }
-      if (silentFrames > silenceLimitFrames || frames > maxFrames || silentFrames > gapFrames + silenceLimitFrames) {
-        await finish();
+      const ev = capture.feed(chunk);
+      if (ev?.kind === "clip") {
+        const file = await saveWav(outDir, "utterance", ev.samples, sampleRate);
+        onUtterance(file);
+      } else if (ev?.kind === "giveUp") {
+        onUtterance(null);
       }
     }
   })().catch(() => {});
@@ -332,13 +237,7 @@ export function startFreeListening(cfg: VoiceConfig, dataDir: string, onUtteranc
     onUtterance,
     setPaused(p: boolean) {
       paused = p;
-      if (p) {
-        capturing = false;
-        speechStarted = false;
-        pcm = [];
-        frames = 0;
-        loudRun = 0;
-      }
+      if (p) capture.flush();
     },
     async stop() {
       stopped = true;
@@ -359,31 +258,24 @@ export async function recordUtterance(cfg: VoiceConfig, outDir: string): Promise
   const sampleRate = 16_000;
   const recorder = new PvRecorder(frameLength, -1);
   recorder.start();
-  const pcm: number[] = [];
-  const frameMs = (frameLength / sampleRate) * 1000;
-  let speechStarted = false;
-  let silentFrames = 0;
-  const silenceLimitFrames = Math.round(1200 / frameMs);
-  const maxFrames = Math.round(cfg.max_utterance_ms / frameMs);
-  const noSpeechFrames = Math.round(8000 / frameMs);
-  let frames = 0;
+  const capture = new SpeechCapture({
+    sampleRate,
+    threshold: cfg.silence_threshold,
+    leadMs: 200,
+    endSilenceMs: 1200,
+    maxMs: cfg.max_utterance_ms,
+    prerollMs: 250,
+  });
+  let clip: number[] | null = null;
   try {
-    while (frames < maxFrames) {
+    // Hard stop after 8 s of silence at the very start.
+    const idleDeadline = Date.now() + 8_000;
+    while (Date.now() < idleDeadline) {
       const chunk = flattenChunk(await recorder.read());
-      for (let i = 0; i < chunk.length; i++) pcm.push(chunk[i]);
-      frames += chunk.length;
-      const tail = pcm.slice(-Math.min(pcm.length, frameLength * 8));
-      const level = rms(tail);
-      if (!speechStarted) {
-        if (level > cfg.silence_threshold) speechStarted = true;
-        else if (frames > noSpeechFrames) return null;
-        continue;
-      }
-      if (level < cfg.silence_threshold) {
-        silentFrames += chunk.length;
-        if (silentFrames > silenceLimitFrames) break;
-      } else {
-        silentFrames = 0;
+      const ev = capture.feed(chunk);
+      if (ev?.kind === "clip") {
+        clip = ev.samples;
+        break;
       }
     }
   } finally {
@@ -394,21 +286,20 @@ export async function recordUtterance(cfg: VoiceConfig, outDir: string): Promise
       /* ignore */
     }
   }
-  if (!speechStarted || pcm.length < sampleRate / 2) return null;
+  if (!clip) return null;
   await fs.mkdir(outDir, { recursive: true });
   const file = path.join(outDir, `utterance-${nowStamp()}.wav`);
-  await writeWav(file, Int16Array.from(pcm), sampleRate);
+  await writeWav(file, Int16Array.from(clip), sampleRate);
   return file;
 }
 
 /**
  * Wake-gated always-listen session — the free "Hey Jarvis".
  *
- * Same mic + loudness VAD as startFreeListening, but each short speech
- * candidate is transcribed by whisper LOCALLY and only counts as a wake when
- * the wake word ("jarvis") appears. The command can ride the same breath
- * (words after the wake word are forwarded) or arrive in the next utterance.
- * If the wake word is heard but nothing follows, a chime-like prompt plays.
+ * Same mic + shared capture engine, but each short speech candidate is
+ * transcribed by whisper LOCALLY and only counts as a wake when the wake word
+ * ("jarvis") appears. The command can ride the same breath (words after the
+ * wake word are forwarded) or arrive in the next utterance.
  */
 export function startWakeListening(
   cfg: VoiceConfig,
@@ -422,51 +313,37 @@ export function startWakeListening(
   recorder.start();
   const outDir = path.join(dataDir, "voice");
 
-  const frameMs = (frameLength / sampleRate) * 1000;
-  const leadFrames = Math.round(400 / frameMs);
-  const silenceLimitFrames = Math.round(WAKE_GAP_MS / frameMs);
-  const maxFrames = Math.round(WAKE_WINDOW_MS / frameMs);
+  // Candidate clips are short: wake word + a few words, end on a 0.9s gap.
+  const capture = new SpeechCapture({
+    sampleRate,
+    threshold: cfg.silence_threshold,
+    leadMs: 400,
+    endSilenceMs: WAKE_GAP_MS,
+    maxMs: WAKE_WINDOW_MS,
+    prerollMs: 400,
+  });
 
   let stopped = false;
   let paused = false;
-  let capturing = false;
-  let speechStarted = false;
-  let loudRun = 0;
-  let silentFrames = 0;
-  let frames = 0;
-  let pcm: number[] = [];
   let armed = false; // wake word heard — the NEXT utterance is a command
+  let checking = false; // a whisper check is in flight
 
-  const finish = async (): Promise<void> => {
-    capturing = false;
-    speechStarted = false;
-    silentFrames = 0;
-    loudRun = 0;
-    frames = 0;
-    const captured = pcm;
-    pcm = [];
-    if (!speechStarted || captured.length < sampleRate / 2) return;
+  const finish = async (clip: number[]): Promise<void> => {
+    checking = true;
     try {
-      await fs.mkdir(outDir, { recursive: true });
-      const file = path.join(outDir, `wake-${nowStamp()}.wav`);
-      await writeWav(file, Int16Array.from(captured), sampleRate);
+      const file = await saveWav(outDir, "wake", clip, sampleRate);
+      if (!file) return;
+      let text = "";
+      try {
+        text = (await transcribe(file, cfg)).trim();
+      } catch {
+        text = ""; // a failed check must never crash the loop
+      }
       if (armed) {
         // The wake word was heard earlier — this utterance IS the command.
         armed = false;
-        let text = "";
-        try {
-          text = (await transcribe(file, cfg)).trim();
-        } catch {
-          text = "";
-        }
         onCommand({ wav: file, text, awaitMore: false });
         return;
-      }
-      let text = "";
-      try {
-        text = (await transcribe(file, cfg)).toLowerCase();
-      } catch {
-        text = ""; // a failed check must never crash the loop
       }
       if (transcriptMatchesWakeWord(text, cfg.wake_word)) {
         const followUp = wordsAfterWakeWord(text, cfg.wake_word);
@@ -477,8 +354,8 @@ export function startWakeListening(
           onCommand({ wav: null, text: "", awaitMore: true });
         }
       }
-    } catch {
-      /* ignore */
+    } finally {
+      checking = false;
     }
   };
 
@@ -486,33 +363,10 @@ export function startWakeListening(
     while (!stopped) {
       const chunk = flattenChunk(await recorder.read());
       if (paused) continue;
-      for (let i = 0; i < chunk.length; i++) pcm.push(chunk[i]);
-      frames += chunk.length;
-      const tail = pcm.slice(-Math.min(pcm.length, frameLength * 8));
-      const level = rms(tail);
-
-      if (!capturing) {
-        if (level > cfg.silence_threshold) {
-          if (++loudRun >= Math.round(leadFrames / chunk.length)) {
-            capturing = true;
-            speechStarted = true;
-            silentFrames = 0;
-            frames = 0;
-            pcm = pcm.slice(-frameLength * 4);
-          }
-        } else {
-          loudRun = 0;
-          if (pcm.length > frameLength * 20) pcm = pcm.slice(-frameLength * 4);
-        }
-        continue;
+      const ev = capture.feed(chunk);
+      if (ev?.kind === "clip") {
+        void finish(ev.samples).catch(() => {});
       }
-
-      if (level >= cfg.silence_threshold) {
-        silentFrames = 0;
-      } else {
-        silentFrames += chunk.length;
-      }
-      if (silentFrames > silenceLimitFrames || frames > maxFrames) await finish();
     }
   })().catch(() => {});
 
@@ -520,13 +374,7 @@ export function startWakeListening(
     onUtterance: (_w: string | null) => {}, // interface shim — commands flow via onCommand
     setPaused(p: boolean) {
       paused = p;
-      if (p) {
-        capturing = false;
-        speechStarted = false;
-        pcm = [];
-        frames = 0;
-        loudRun = 0;
-      }
+      if (p) capture.flush();
     },
     async stop() {
       stopped = true;
@@ -535,7 +383,28 @@ export function startWakeListening(
         recorder.release();
       } catch {
         /* ignore */
-     }
+      }
     },
   };
+}
+
+/** Minimal 16-bit mono WAV writer (used by both session and push-to-talk). */
+export async function writeWav(file: string, samples: Int16Array, sampleRate: number): Promise<void> {
+  const dataLen = samples.length * 2;
+  const buf = Buffer.alloc(44 + dataLen);
+  buf.write("RIFF", 0);
+  buf.writeUInt32LE(36 + dataLen, 4);
+  buf.write("WAVE", 8);
+  buf.write("fmt ", 12);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(sampleRate, 24);
+  buf.writeUInt16LE(sampleRate * 2, 28);
+  buf.writeUInt16LE(2, 32);
+  buf.writeUInt16LE(16, 34);
+  buf.write("data", 36);
+  buf.writeUInt32LE(dataLen, 40);
+  for (let i = 0; i < samples.length; i++) buf.writeInt16LE(samples[i], 44 + i * 2);
+  await fs.writeFile(file, buf);
 }

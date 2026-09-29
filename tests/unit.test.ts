@@ -923,3 +923,52 @@ test('free wake-word matcher: jarvis variants hit, other speech does not', async
   assert.deepEqual(wordsAfterWakeWord('jarvis what time is it', 'jarvis'), ['what', 'time', 'is', 'it']);
   assert.deepEqual(wordsAfterWakeWord('jarvis', 'jarvis'), []);
 });
+
+test('speech capture: sample-correct timing (no premature cuts)', async () => {
+  const { SpeechCapture } = await import('../src/voice/capture.js');
+  const sr = 16_000;
+  const cap = new SpeechCapture({
+    sampleRate: sr, threshold: 450, leadMs: 400, endSilenceMs: 900, maxMs: 4500, prerollMs: 400,
+  });
+  const loud = (n: number, amp = 3000): Int16Array => {
+    const a = new Int16Array(n);
+    for (let i = 0; i < n; i++) a[i] = ((i * 7919) % 2000) - 1000 + amp;
+    return a;
+  };
+  const quiet = (n: number): Int16Array => new Int16Array(n); // silence
+  // Speak for 1 second: capture must START (not end).
+  let ev: any = null;
+  for (let i = 0; i < 20; i++) ev = cap.feed(loud(800)); // 20 x 50ms = 1s
+  assert.equal(cap.isCapturing, true, 'capture must be active while speaking');
+  // 0.5s of silence must NOT end a 0.9s-silence clip.
+  for (let i = 0; i < 10; i++) cap.feed(quiet(800));
+  assert.equal(cap.isCapturing, true, '0.5s of silence must not end the clip');
+  // A full 0.9s+ of silence must end it, with ~1.9s of audio inside.
+  for (let i = 0; i < 20; i++) {
+    const e = cap.feed(quiet(800));
+    if (e) ev = e; // keep the clip event — later silent chunks return null
+  }
+  assert.ok(ev && ev.kind === 'clip', 'clip must complete after end-silence');
+  if (ev && ev.kind === 'clip') {
+    assert.ok(ev.samples.length > sr, `clip must hold ~2s of audio, got ${ev.samples.length} samples`);
+    assert.equal(ev.hitMax, false);
+  }
+  // And a second utterance can be captured afterwards.
+  for (let i = 0; i < 20; i++) cap.feed(loud(800));
+  assert.equal(cap.isCapturing, true, 'engine must re-arm after a finished clip');
+});
+
+test('speech capture: short blips and silence are discarded', async () => {
+  const { SpeechCapture } = await import('../src/voice/capture.js');
+  const cap = new SpeechCapture({
+    sampleRate: 16_000, threshold: 450, leadMs: 400, endSilenceMs: 900, maxMs: 4500, prerollMs: 400,
+  });
+  const blip = new Int16Array(800); // one 50ms loud blip
+  for (let i = 0; i < blip.length; i++) blip[i] = 3000;
+  let sawClip = false;
+  for (let i = 0; i < 60; i++) {
+    const ev = cap.feed(i === 0 ? blip : new Int16Array(800));
+    if (ev?.kind === 'clip') sawClip = true;
+  }
+  assert.ok(!sawClip, 'a single blip must not become a clip');
+});

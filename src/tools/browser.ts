@@ -1,11 +1,16 @@
 import path from "node:path";
+import http from "node:http";
 import { promises as fsp } from "node:fs";
-import type { BrowserContext, Page } from "playwright";
+import { execFile, execSync } from "node:child_process";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import type { Browser, BrowserContext, Page } from "playwright";
 import type { Tool, ToolContext } from "./types.js";
 import { truncate } from "../core/util.js";
 
 let context: BrowserContext | null = null;
 let page: Page | null = null;
+let joined = false; // true when we attached to a Chrome owned by another Jarvis process
+let launchPromise: Promise<BrowserContext> | null = null;
 
 /**
  * Persistent profile: cookies and logins SURVIVE restarts, so the user signs
@@ -13,11 +18,155 @@ let page: Page | null = null;
  * mail brief too).
  */
 const PROFILE_DIR = path.join(process.cwd(), "data", "browser-profile");
+const PROFILE_NEEDLE = PROFILE_DIR.toLowerCase();
 
 /**
- * A crash or a killed process leaves Chromium's profile lock behind, and then
- * every later launch fails with "Opening in existing browser session". Clearing
- * those three tiny lock files is what makes the Gmail window open again.
+ * Cross-process sharing: EVERY Jarvis process (UI server, voice agent, run,
+ * scheduled jobs) uses the SAME Chrome instance instead of each trying to
+ * launch its own on the same profile — which is what caused the recurring
+ * "Opening in existing browser session" failure.
+ *
+ * The first process to need the browser launches Chrome with a CDP debug
+ * port and records the port + owner PID in data/browser-cdp.lock. Later
+ * processes attach to that Chrome over CDP and share its profile/tabs.
+ * If the recorded Chrome is gone (crash / kill / reboot), the stale lock is
+ * ignored and the caller becomes the new owner.
+ */
+const CDP_PORT = 9222;
+const CDP_HOST = `http://127.0.0.1:${CDP_PORT}`;
+const LOCK_FILE = path.join(process.cwd(), "data", "browser-cdp.lock");
+
+interface CdpLock {
+  pid: number;
+  port: number;
+  startedAt: string;
+}
+
+function debug(msg: string): void {
+  if (process.env.JARVIS_BROWSER_DEBUG) console.log(`[browser] ${msg}`);
+}
+
+function readCdpLock(): CdpLock | null {
+  try {
+    const raw = JSON.parse(readFileSync(LOCK_FILE, "utf8")) as CdpLock;
+    return raw && typeof raw.pid === "number" ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCdpLock(pid: number, port: number): void {
+  try {
+    mkdirSync(path.dirname(LOCK_FILE), { recursive: true });
+    writeFileSync(LOCK_FILE, JSON.stringify({ pid, port, startedAt: new Date().toISOString() } satisfies CdpLock, null, 1));
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Find the PID that owns the CDP listener (netstat), used when Playwright
+ *  does not expose the child process (channel launches). */
+function pidOfPortListener(port: number): number {
+  try {
+    const out = execSync(`netstat -ano | findstr ":${port}" | findstr "LISTENING"`, { timeout: 5000, windowsHide: true }).toString();
+    const m = out.match(/\s(\d+)\s*$/m);
+    return m ? Number(m[1]) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function removeCdpLock(): Promise<void> {
+  try {
+    await fsp.rm(LOCK_FILE, { force: true });
+  } catch {
+    /* best-effort */
+  }
+}
+
+function httpGetJson(url: string, timeoutMs = 1500): Promise<Record<string, unknown> | null> {
+  return new Promise((resolve) => {
+    const req = http.get(url, { timeout: timeoutMs }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(data) as Record<string, unknown>);
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(null);
+    });
+    req.on("error", () => resolve(null));
+  });
+}
+
+/** Is anything serving the CDP endpoint? */
+async function cdpAlive(): Promise<boolean> {
+  const v = await httpGetJson(`${CDP_HOST}/json/version`, 1500);
+  return !!(v && v.Browser);
+}
+
+/** Does a process with this PID exist (and look like Chrome)? */
+async function pidAlive(pid: number): Promise<boolean> {
+  if (!pid || pid <= 0) return false;
+  if (process.platform !== "win32") {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return new Promise((resolve) => {
+    execFile("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { timeout: 5000, windowsHide: true }, (err, stdout) => {
+      if (err) return resolve(false);
+      resolve(String(stdout).toLowerCase().includes("chrome"));
+    });
+  });
+}
+
+/**
+ * Kill ONLY agent-owned Chrome windows: chrome.exe processes whose command
+ * line references OUR profile directory. The user's personal Chrome (normal
+ * window, different profile) never matches and is never touched.
+ */
+const KILL_AGENT_CHROME_PS = `
+$ErrorActionPreference = "SilentlyContinue"
+$killed = 0
+$procs = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'"
+foreach ($p in $procs) {
+  $cl = [string]$p.CommandLine
+  if ($cl -and $cl.ToLower().Contains('${PROFILE_NEEDLE}')) {
+    Stop-Process -Id $p.ProcessId -Force
+    $killed++
+  }
+}
+Write-Output ("KILLED=" + $killed)
+`;
+
+export async function killAgentChrome(): Promise<number> {
+  if (process.platform !== "win32") return 0;
+  return new Promise((resolve) => {
+    execFile(
+      "powershell.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", KILL_AGENT_CHROME_PS],
+      { timeout: 20000, windowsHide: true },
+      (err, stdout) => {
+        const m = String(stdout || "").match(/KILLED=(\d+)/);
+        resolve(m ? Number(m[1]) : 0);
+      }
+    );
+  });
+}
+
+/**
+ * A crash or a killed process leaves Chromium's profile lock behind. Clearing
+ * those three tiny lock files lets a fresh launch proceed.
  */
 async function clearStaleProfileLocks(): Promise<boolean> {
   let cleared = false;
@@ -32,34 +181,151 @@ async function clearStaleProfileLocks(): Promise<boolean> {
   return cleared;
 }
 
-async function getContext(ctx: ToolContext): Promise<BrowserContext> {
-  if (context) return context;
+/** Attach to the Chrome owned by another Jarvis process (via its CDP port).
+ *  Patient: up to ~14s of retries — Chrome may still be starting up. */
+async function tryJoinOverCdp(chromium: import("playwright").BrowserType): Promise<BrowserContext | null> {
+  const deadline = Date.now() + 14_000;
+  while (Date.now() < deadline) {
+    if (await cdpAlive()) {
+      try {
+        const browser: Browser = await chromium.connectOverCDP(CDP_HOST, { timeout: 8000 });
+        for (let i = 0; i < 10; i++) {
+          const ctx = browser.contexts()[0];
+          if (ctx) return ctx;
+          await new Promise((r) => setTimeout(r, 300));
+        }
+        return await browser.newContext();
+      } catch {
+        /* Chrome busy — retry within the deadline */
+      }
+    }
+    await new Promise((r) => setTimeout(r, 700));
+  }
+  return null;
+}
+
+async function tryLaunchPersistent(ctx: ToolContext): Promise<BrowserContext> {
   const { chromium } = await import("playwright");
   // Google refuses sign-in from Playwright's bundled Chromium ("this browser
   // may not be secure" -> login loops / "no permission"). The user's REAL
   // Chrome is trusted by Google, so prefer the "chrome" channel; fall back to
-  // bundled Chromium if Chrome isn't installed.
-  const launch = (): Promise<BrowserContext> =>
-    chromium.launchPersistentContext(PROFILE_DIR, {
-      headless: ctx.cfg.browser.headless,
-      channel: process.platform === "win32" ? "chrome" : undefined,
-      args: ["--disable-blink-features=AutomationControlled"],
-      viewport: { width: 1366, height: 900 },
-      ignoreHTTPSErrors: true,
-    });
+  // bundled Chromium if Chrome isn't installed. The debug port lets sibling
+  // Jarvis processes share this very browser instead of fighting over the
+  // profile.
+  return chromium.launchPersistentContext(PROFILE_DIR, {
+    headless: ctx.cfg.browser.headless,
+    channel: process.platform === "win32" ? "chrome" : undefined,
+    args: ["--disable-blink-features=AutomationControlled", `--remote-debugging-port=${CDP_PORT}`],
+    viewport: { width: 1366, height: 900 },
+    ignoreHTTPSErrors: true,
+    timeout: 60_000,
+  });
+}
+
+async function launchAsOwner(ctx: ToolContext): Promise<BrowserContext> {
+  const context0 = await tryLaunchPersistent(ctx);
+  joined = false;
   try {
-    context = await launch();
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (/existing browser session|Singleton|ProcessSingleton|user data directory is already in use/i.test(msg)) {
+    const proc = (context0.browser() as { process?: () => { pid?: number } | null } | null)?.process?.();
+    const pid = proc?.pid || pidOfPortListener(CDP_PORT);
+    writeCdpLock(pid, CDP_PORT);
+  } catch {
+    writeCdpLock(pidOfPortListener(CDP_PORT), CDP_PORT);
+  }
+  return context0;
+}
+
+async function getContext(ctx: ToolContext): Promise<BrowserContext> {
+  if (context) return context;
+  if (launchPromise) return launchPromise;
+
+  launchPromise = (async () => {
+    const { chromium } = await import("playwright");
+
+    // 1) Another Jarvis process may already own a browser — share it.
+    //    NEVER launch a second Chrome while a live owner lock exists: two
+    //    instances on one profile corrupt data and recreate the original bug.
+    const lock = readCdpLock();
+    if (lock) {
+      const cdpUp = await cdpAlive();
+      const ownerAlive = cdpUp || (await pidAlive(lock.pid));
+      debug(`lock found: pid=${lock.pid} cdp=${cdpUp} ownerAlive=${ownerAlive}`);
+      if (ownerAlive) {
+        const shared = await tryJoinOverCdp(chromium);
+        if (shared) {
+          debug("joined existing browser over CDP");
+          joined = true;
+          return shared;
+        }
+        // Owner holds the profile but its CDP is unreachable (old-style
+        // launch without debug port, or wedged Chrome). Attaching is
+        // impossible and launching is forbidden — reap and take over.
+        debug("owner alive but not joinable — reaping agent chrome and taking over");
+        await killAgentChrome();
+        await new Promise((r) => setTimeout(r, 1500));
+        await clearStaleProfileLocks();
+        await removeCdpLock();
+        return await launchAsOwner(ctx);
+      }
+      debug("lock exists but owner is dead — taking over");
+      await removeCdpLock();
       await clearStaleProfileLocks();
-      context = await launch(); // one retry with a clean profile lock
-    } else {
+      try {
+        return await launchAsOwner(ctx);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/existing browser session|Singleton|ProcessSingleton|user data directory|browser has been closed/i.test(msg)) {
+          // A sibling raced us and owns the profile — join it instead.
+          debug("launch blocked — joining the racing winner");
+          const shared = await tryJoinOverCdp(chromium);
+          if (shared) {
+            joined = true;
+            return shared;
+          }
+          await killAgentChrome();
+          await new Promise((r) => setTimeout(r, 1500));
+          await clearStaleProfileLocks();
+          await removeCdpLock();
+          return await launchAsOwner(ctx);
+        }
+        throw e;
+      }
+    }
+
+    // 2) No lock file at all: clear stale artifacts and become the owner.
+    debug("no lock file — becoming owner");
+    await clearStaleProfileLocks();
+    try {
+      return await launchAsOwner(ctx);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/existing browser session|Singleton|ProcessSingleton|user data directory|browser has been closed/i.test(msg)) {
+        debug("launch blocked — orphan or racing sibling; trying join, then reap");
+        const shared = await tryJoinOverCdp(chromium);
+        if (shared) {
+          joined = true;
+          return shared;
+        }
+        await killAgentChrome();
+        await new Promise((r) => setTimeout(r, 1500));
+        await clearStaleProfileLocks();
+        await removeCdpLock();
+        return await launchAsOwner(ctx);
+      }
       throw e;
     }
+  })();
+
+  try {
+    context = await launchPromise;
+    context.setDefaultTimeout(15_000);
+    return context;
+  } catch (e) {
+    launchPromise = null;
+    throw e;
+  } finally {
+    launchPromise = null;
   }
-  context.setDefaultTimeout(15_000);
-  return context;
 }
 
 async function getPage(ctx: ToolContext): Promise<Page> {
@@ -233,10 +499,25 @@ export function browserTools(): Tool[] {
 
 export async function shutdownBrowser(): Promise<void> {
   try {
-    await context?.close();
+    if (context) {
+      if (joined) {
+        // We only attached to a Chrome owned by another process: disconnect
+        // (Browser.close() on a CDP connection just disconnects) and leave
+        // the shared browser running for its real owner.
+        await context.browser()?.close();
+      } else {
+        await context.close();
+      }
+    }
   } catch {
     /* ignore */
   }
   context = null;
   page = null;
+  launchPromise = null;
+  const wasOwner = !joined;
+  joined = false;
+  if (wasOwner) {
+    await removeCdpLock();
+  }
 }

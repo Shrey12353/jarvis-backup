@@ -67,21 +67,36 @@ export async function startTelegramBot(opts: TelegramBotOptions): Promise<void> 
   // Persistent state: owner chat id (learned on first /start) + update cursor.
   let ownerChatId = 0;
   let offset = 0;
+  let pairingPin = "";
   try {
-    const s = JSON.parse(await fsp.readFile(statePath, "utf8")) as { ownerChatId?: number; offset?: number };
+    const s = JSON.parse(await fsp.readFile(statePath, "utf8")) as {
+      ownerChatId?: number;
+      offset?: number;
+      pairingPin?: string;
+    };
     ownerChatId = s.ownerChatId ?? 0;
     offset = s.offset ?? 0;
+    pairingPin = s.pairingPin ?? "";
   } catch {
     /* first run */
   }
+  if (!pairingPin) {
+    // Stable 6-digit PIN lets the owner re-link a new phone/account with
+    // "/link <pin>" — no PC access needed. Stored locally; shown in the boot
+    // log and the /api/status payload.
+    pairingPin = String(Math.floor(100_000 + Math.random() * 900_000));
+  }
   const saveState = async () => {
-    await fsp.writeFile(statePath, JSON.stringify({ ownerChatId, offset }), "utf8").catch(() => {});
+    await fsp.writeFile(statePath, JSON.stringify({ ownerChatId, offset, pairingPin }), "utf8").catch(() => {});
   };
+  await saveState();
 
   let busy = false; // one brain run at a time — same guard as the web UI
   const pending = new Map<number, (ok: boolean) => void>(); // approval promises
 
-  await log(`[jarvis] telegram bot polling (owner: ${ownerChatId ? "linked" : "awaiting /start"})`);
+  await log(
+    `[jarvis] telegram bot polling (owner: ${ownerChatId ? `linked ${ownerChatId}` : "awaiting /start"}; re-link PIN: ${pairingPin})`,
+  );
 
   for (;;) {
     try {
@@ -97,21 +112,29 @@ export async function startTelegramBot(opts: TelegramBotOptions): Promise<void> 
         if (!msg?.text) continue;
         const chatId = msg.chat.id;
 
-        // Owner binding: the FIRST human /start claims the bot permanently.
-        if (!ownerChatId) {
-          if (/^\/start/.test(msg.text) && !msg.from?.is_bot) {
+        // Ownership: unlinked -> any human /start claims the bot. Linked -> a
+        // matching "/link <pin>" from another chat MOVES ownership there (new
+        // phone/account), wrong pin gets the same generic stranger reply so
+        // probing reveals nothing.
+        if (chatId !== ownerChatId) {
+          const t = msg.text.trim();
+          const pinMatch = /^\/(?:link|start)(?:\s+(\d{6}))?\s*$/.exec(t);
+          const pinOk = !!pinMatch && pinMatch[1] === pairingPin;
+          const firstStart = !ownerChatId && /^\/start\b/.test(t) && !msg.from?.is_bot;
+          if (pinOk || firstStart) {
+            const was = ownerChatId;
             ownerChatId = chatId;
             await saveState();
             await sendText(
               token,
               chatId,
-              "Linked! This phone now talks to your Jarvis. Try: 'what's on today?' or 'remind me in 10 minutes to stretch'. Only this chat can control him.",
+              was
+                ? "Re-linked! This chat now talks to your Jarvis (the previous chat was released). Reminders will push here too."
+                : "Linked! This phone now talks to your Jarvis. Try: 'what's on today?' or 'remind me in 10 minutes to stretch'. Only this chat can control him.",
             );
+          } else {
+            await sendText(token, chatId, ownerChatId ? "This bot belongs to someone else." : "Send /start to claim this bot.").catch(() => {});
           }
-          continue;
-        }
-        if (chatId !== ownerChatId) {
-          await sendText(token, chatId, "This bot belongs to someone else.").catch(() => {});
           continue;
         }
 
@@ -131,12 +154,12 @@ export async function startTelegramBot(opts: TelegramBotOptions): Promise<void> 
         if (text === "/start" || text === "/help") {
           await sendText(
             token,
-            chatId,
-            [
-              "You're talking to your Jarvis (same brain as the PC).",
-              "Try: 'what's on today?', 'remind me tomorrow 9am to call X', 'check my email', 'what did you do today?'",
-              "Anything destructive asks first — reply y/n.",
-            ].join("\n"),
+            chatId,              [
+                "You're talking to your Jarvis (same brain as the PC).",
+                "Try: 'what's on today?', 'remind me tomorrow 9am to call X', 'check my email', 'what did you do today?'",
+                "Anything destructive asks first — reply y/n.",
+                "New phone or new account? Send '/link <6-digit PIN>' from it (PIN is in the PC boot log / status page).",
+              ].join("\n"),
           );
           continue;
         }
@@ -193,10 +216,18 @@ export async function pushReminder(token: string, ownerChatId: number, text: str
 }
 
 export async function readOwnerChatId(dataDir: string): Promise<number> {
+  return (await readTelegramState(dataDir)).ownerChatId;
+}
+
+/** Owner chat id + pairing pin (for the status endpoint). */
+export async function readTelegramState(dataDir: string): Promise<{ ownerChatId: number; pairingPin: string }> {
   try {
-    const s = JSON.parse(await fsp.readFile(path.join(dataDir, STATE_FILE), "utf8")) as { ownerChatId?: number };
-    return s.ownerChatId ?? 0;
+    const s = JSON.parse(await fsp.readFile(path.join(dataDir, STATE_FILE), "utf8")) as {
+      ownerChatId?: number;
+      pairingPin?: string;
+    };
+    return { ownerChatId: s.ownerChatId ?? 0, pairingPin: s.pairingPin ?? "" };
   } catch {
-    return 0;
+    return { ownerChatId: 0, pairingPin: "" };
   }
 }

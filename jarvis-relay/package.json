@@ -1,0 +1,10 @@
+{
+  "name": "jarvis-relay",
+  "version": "1.0.0",
+  "description": "Jarvis's 24/7 cloud twin: Telegram bot + reminders + cloud-brain chat. Runs on any small Linux VPS; no dependencies beyond Node 18+.",
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node relay.mjs"
+  }
+}

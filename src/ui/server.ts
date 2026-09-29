@@ -27,7 +27,7 @@ import { describeOrWait, visionCached } from "../core/vision.js";
 import { captureScreen } from "../core/pc.js";
 import { showNotification } from "../core/notify.js";
 import { detectTimezone } from "../core/tz.js";
-import { startTelegramBot, pushReminder, readOwnerChatId } from "../core/telegram.js";
+import { startTelegramBot, pushReminder, readOwnerChatId, readTelegramState } from "../core/telegram.js";
 import { buildRegistry } from "../index.js";
 import { shutdownBrowser } from "../tools/browser.js";
 import { transcribe } from "../voice/stt.js";
@@ -196,6 +196,14 @@ async function main(): Promise<void> {
     const controller = new AbortController();
     activeRun = { controller, chatId: "" };
     const sse = attachSse(res);
+    // Watchdog: a wedged tool (stalled browser/Ollama call) once kept `busy`
+    // true for many minutes and made the UI look hung. Abort the run after a
+    // generous 10-minute ceiling — long trading scans fit, dead runs don't.
+    const watchdog = setTimeout(() => {
+      if (activeRun === null) return;
+      void log("chat watchdog: run exceeded 10m — aborting", "warn").catch(() => {});
+      controller.abort();
+    }, 10 * 60_000);
     try {
       const body = JSON.parse((await readBody(req)).toString("utf8") || "{}") as {
         message?: string;
@@ -269,6 +277,7 @@ async function main(): Promise<void> {
       await log(`ui chat error: ${msg}`, "error").catch(() => {});
       sse.sse("error", { message: msg });
     } finally {
+      clearTimeout(watchdog);
       for (const [, resolve] of activeApprovals) resolve(false);
       activeApprovals.clear();
       activeRun = null;
@@ -458,6 +467,7 @@ async function main(): Promise<void> {
           busy,
           visionModel: (cfg.ollama.vision_model || "").trim(),
           memoryCount: (await listFacts(cfg.paths.data)).length,
+          telegram: await readTelegramState(cfg.paths.data),
         }));
         return;
       }
