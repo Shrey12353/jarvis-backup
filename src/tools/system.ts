@@ -21,7 +21,9 @@ export const systemTools: Tool[] = [
   {
     name: "launch_app",
     description: "Launch an installed application by name (e.g. spotify, notepad, chrome, explorer).",
-    safety: "ask",
+    // Browsing/tooling should not stall on an approval card: opening an app is
+    // as harmless as open_url (already auto). Destructive actions stay gated.
+    safety: "auto",
     parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
     async run(args) {
       const name = String(args.name).replace(/[&|<>^"]/g, "");

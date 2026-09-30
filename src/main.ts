@@ -7,6 +7,7 @@ import { initLogging, log } from "./core/logger.js";
 import { OllamaClient, isOllamaDownError, ollamaDownMessage, tryStartOllama, waitForOllama } from "./core/ollama.js";
 import { Agent } from "./core/agent.js";
 import { buildRegistry } from "./index.js";
+import { registerCustomStrategies } from "./trading/custom-strategy.js";
 import { shutdownBrowser } from "./tools/browser.js";
 import { voiceLoop } from "./voice/loop.js";
 import type { ToolRegistry } from "./tools/types.js";
@@ -101,6 +102,8 @@ async function main(): Promise<void> {
   }
   await ensureDirs(cfg.paths.data);
   initLogging(cfg.paths.data);
+  // Custom backtest strategies the user has saved (data/strategies/*.json).
+  await registerCustomStrategies(cfg.paths.data);
 
   if (args.mode === "doctor") {
     await doctor(cfg);

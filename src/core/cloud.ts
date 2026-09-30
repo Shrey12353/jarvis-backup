@@ -1,5 +1,6 @@
 import type { AppConfig } from "./config.js";
 import type { OllamaMessage, OllamaTool, ChatResponse } from "./ollama.js";
+import { pickModelOrder, LAST_RESORT, type TaskKind } from "./model-router.js";
 
 /**
  * Optional cloud brain — any OpenAI-compatible chat API (Groq, OpenRouter,
@@ -86,6 +87,8 @@ export interface CloudOpts {
   temperature: number;
   onContent?: (delta: string) => void;
   signal?: AbortSignal;
+  /** What the model is being asked to do — selects the routing preference list. */
+  task?: TaskKind;
 }
 
 /**
@@ -155,10 +158,21 @@ export function slimForCloud(messages: OllamaMessage[]): OllamaMessage[] {
 }
 
 export class CloudClient {
+  /** The concrete model that last answered — with an aggregator (model "auto")
+   *  the configured name is a placeholder, so this is the only way to see what
+   *  actually served the request. Surfaced in the UI as "brain: <model>". */
+  private lastModelUsed = "";
+  /** Model ids the gateway offered, cached so routing costs no extra call per turn. */
+  private availableCache: { at: number; ids: string[] } | null = null;
+
   constructor(private cfg: NonNullable<AppConfig["cloud"]>) {}
 
   get model(): string {
     return this.cfg.model;
+  }
+
+  get lastModel(): string {
+    return this.lastModelUsed || this.cfg.model;
   }
 
   private headers(): Record<string, string> {
@@ -220,49 +234,93 @@ export class CloudClient {
     }
   }
 
-  /** Chat with tool support (OpenAI-compatible streaming SSE). */
+  /** Model ids the gateway currently offers, cached briefly (one HTTP call). */
+  private async availableModels(): Promise<string[]> {
+    if (this.availableCache && Date.now() - this.availableCache.at < 300_000) return this.availableCache.ids;
+    const ids = await this.listRemoteModels();
+    if (ids.length) this.availableCache = { at: Date.now(), ids };
+    return ids;
+  }
+
+  /** True when the endpoint can serve many models (FreeLLMAPI) rather than one. */
+  private get isAggregator(): boolean {
+    return this.cfg.model === LAST_RESORT || /localhost|127\.0\.0\.1/i.test(this.cfg.base_url);
+  }
+
+  /** Ordered models to try for this job; a direct provider has exactly one. */
+  private async candidateModels(kind: TaskKind): Promise<string[]> {
+    if (!this.isAggregator) return [this.cfg.model];
+    return pickModelOrder(kind, await this.availableModels(), this.cfg.model);
+  }
+
+  /** Chat with tool support (OpenAI-compatible streaming SSE).
+   *
+   * On an aggregator (FreeLLMAPI) a failure is cheap to recover from: move to
+   * the next model preferred for this kind of job instead of waiting out a rate
+   * limit that may never clear. On a direct provider (Groq) there is only one
+   * model, so the wait-and-retry plus self-heal behaviour is kept. */
   async chat(messages: OllamaMessage[], tools: OllamaTool[], opts: CloudOpts): Promise<ChatResponse> {
-    // If the configured model was retired (HTTP 404 model_not_found), switch to
-    // the best available one and retry once — self-healing, no user action.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        return await this.chatOnce(messages, tools, opts);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        // Free tiers rate-limit per minute (Groq: ~8k tokens/min). When we hit
-        // the cap, wait out the window (the API tells us how long) and retry
-        // on the same provider — a few seconds of patience usually beats
-        // dropping to the slower local brain for the whole turn. Bounded:
-        // attempt keeps counting, so at most two waits before we give up.
-        if (/HTTP 429/.test(msg) && attempt < 2 && !opts.signal?.aborted) {
-          const waitMs = parseRetryAfterMs(msg) ?? 20_000;
-          if (waitMs <= 45_000) {
-            console.warn(`[jarvis] cloud rate-limited — retrying in ${Math.round(waitMs / 1000)}s.`);
-            await new Promise((r) => setTimeout(r, waitMs));
-            continue; // retry the same provider; self-heal slots stay intact
+    const kind: TaskKind = opts.task ?? (tools.length ? "tools" : "general");
+    const candidates = await this.candidateModels(kind);
+    const configured = this.cfg.model;
+    let lastErr: unknown = null;
+
+    for (let ci = 0; ci < candidates.length; ci++) {
+      const model = candidates[ci];
+      this.cfg.model = model;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          // Success leaves this.cfg.model on the winner, so pickModelOrder keeps
+          // it sticky next turn and a working session does not hop models.
+          return await this.chatOnce(messages, tools, opts);
+        } catch (e) {
+          lastErr = e;
+          if (opts.signal?.aborted) throw e;
+          const msg = e instanceof Error ? e.message : String(e);
+
+          if (this.isAggregator) {
+            // "All models exhausted", a missing provider key and a broken
+            // tool-caller all mean the same thing here: try the next one.
+            if (ci < candidates.length - 1) {
+              console.warn(`[jarvis] ${model} unusable (${msg.slice(0, 90)}); trying ${candidates[ci + 1]}.`);
+            }
+            break;
           }
-        }
-        const retired = /HTTP 404/.test(msg) && /model/i.test(msg);
-        // Some free models emit malformed tool calls for a big tool set
-        // (Groq: "Failed to call a function", "Failed to parse tool call
-        // arguments as JSON", failed_generation). Heal the same way as a
-        // retired model: switch to one that can, once.
-        const toolCallBroken =
-          /failed to (?:call a function|parse tool call)|failed_generation|tool_use_failed/i.test(msg);
-        if (attempt === 0 && (retired || toolCallBroken)) {
-          const next = pickPreferredModel(await this.listRemoteModels(), this.cfg.model);
-          if (next) {
-            console.warn(
-              `[jarvis] cloud model '${this.cfg.model}' ${retired ? "is gone" : "can't call tools here"} — switching to '${next}'.`
-            );
-            this.cfg.model = next;
-            continue;
+
+          // Direct provider: a short per-minute cap is worth waiting out.
+          if (/HTTP 429|rate limit/i.test(msg) && attempt === 0) {
+            const waitMs = parseRetryAfterMs(msg) ?? 20_000;
+            if (waitMs <= 45_000) {
+              console.warn(`[jarvis] cloud rate-limited — retrying in ${Math.round(waitMs / 1000)}s.`);
+              await new Promise((r) => setTimeout(r, waitMs));
+              continue;
+            }
           }
+          const retired = /HTTP 404/.test(msg) && /model/i.test(msg);
+          // Some free models emit malformed tool calls for a big tool set
+          // (Groq: "Failed to call a function", "failed_generation"). Heal the
+          // same way as a retired model: switch to one that can, once.
+          const toolCallBroken =
+            /failed to (?:call a function|parse tool call)|failed_generation|tool_use_failed/i.test(msg);
+          if (attempt === 0 && (retired || toolCallBroken)) {
+            const next = pickPreferredModel(await this.listRemoteModels(), this.cfg.model);
+            if (next) {
+              console.warn(
+                `[jarvis] cloud model '${this.cfg.model}' ${retired ? "is gone" : "can't call tools here"} — switching to '${next}'.`
+              );
+              this.cfg.model = next;
+              continue;
+            }
+          }
+          break;
         }
-        throw e;
       }
     }
-    throw new Error("unreachable");
+
+    // Nothing worked: restore the configured name so the next turn re-routes
+    // from scratch instead of staying stuck on the model that just failed.
+    this.cfg.model = configured;
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? "cloud brain: no usable model"));
   }
 
   private async chatOnce(messages: OllamaMessage[], tools: OllamaTool[], opts: CloudOpts): Promise<ChatResponse> {
@@ -309,6 +367,7 @@ export class CloudClient {
         const data = line.slice(5).trim();
         if (!data || data === "[DONE]") continue;
         let j: {
+          model?: string;
           choices?: Array<{
             delta?: {
               content?: string | null;
@@ -322,6 +381,9 @@ export class CloudClient {
         } catch {
           continue;
         }
+        // Aggregators (FreeLLMAPI) report the model that actually served each
+        // chunk — remember it so the UI can show the real brain.
+        if (j.model) this.lastModelUsed = j.model;
         if (j.error?.message) throw new Error(`cloud brain error: ${j.error.message}`);
         const delta = j.choices?.[0]?.delta;
         if (!delta) continue;
@@ -370,7 +432,10 @@ export class CloudClient {
 
 /** Compact tool schemas for the cloud (free-tier token budgets). */
 export function minifyTools(tools: OllamaTool[]): Array<Record<string, unknown>> {
-  return tools.slice(0, 60).map((t) => {
+  // Keep a little headroom over the current tool count so a newly added tool is
+  // never silently dropped from the cloud payload (only the description text is
+  // trimmed below, which is where the token savings actually come from).
+  return tools.slice(0, 80).map((t) => {
     const raw = t.function.parameters as { properties?: Record<string, unknown>; required?: string[] };
     const props: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(raw.properties ?? {})) {

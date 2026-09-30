@@ -29,6 +29,7 @@ import { showNotification } from "../core/notify.js";
 import { detectTimezone } from "../core/tz.js";
 import { startTelegramBot, pushReminder, readOwnerChatId, readTelegramState } from "../core/telegram.js";
 import { buildRegistry } from "../index.js";
+import { registerCustomStrategies } from "../trading/custom-strategy.js";
 import { shutdownBrowser } from "../tools/browser.js";
 import { transcribe } from "../voice/stt.js";
 import { pcmToWav } from "./wav.js";
@@ -97,6 +98,8 @@ async function main(): Promise<void> {
   await ensureChatsDir(cfg.paths.data);
   await migrateLegacySession(cfg.paths.data);
   initLogging(cfg.paths.data);
+  // Custom backtest strategies the user has saved (data/strategies/*.json).
+  await registerCustomStrategies(cfg.paths.data);
   // Detect the user's REAL local timezone once (Node's ambient zone resolves
   // to UTC on this Windows setup, which made reminder toasts show UTC times).
   const tzMin = await detectTimezone();
@@ -387,6 +390,7 @@ async function main(): Promise<void> {
         const types: Record<string, string> = {
           ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
           ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+          ".svg": "image/svg+xml", ".csv": "text/csv", ".md": "text/markdown",
         };
         res.writeHead(200, { "Content-Type": types[path.extname(abs).toLowerCase()] ?? "application/octet-stream" });
         res.end(await fsp.readFile(abs));
@@ -462,7 +466,9 @@ async function main(): Promise<void> {
           workspace: cfg.agent.workspace,
           fullAuto: cfg.agent.full_auto,
           brainOk,
-          cloud: cloud ? { model: cfg.cloud!.model } : null,
+          // `model` is what we ASK for (usually "auto"); `lastModel` is the real
+          // model the aggregator served last — shown in the UI as "brain: …".
+          cloud: cloud ? { model: cfg.cloud!.model, lastModel: agent?.lastCloudModel || null } : null,
           backupCloud: !!cloudBackup,
           busy,
           visionModel: (cfg.ollama.vision_model || "").trim(),

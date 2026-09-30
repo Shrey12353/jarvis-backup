@@ -2,6 +2,14 @@ node_modules/
 dist/
 data/
 .env
+.env.*
 config.yaml
 *.log
+*.err
+*.out
 voice-tools/
+
+# Local runtime artefacts that must never be published
+freellmapi.err
+freellmapi.out
+*.db

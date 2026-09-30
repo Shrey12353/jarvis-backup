@@ -342,6 +342,26 @@ export async function openOnAgentProfile(ctx: ToolContext, url: string): Promise
   return p;
 }
 
+/**
+ * Open a URL in its OWN tab on the same signed-in profile, and hand back a
+ * closer. Used for background lookups that must not hijack the tab the user is
+ * working in — navigating away mid-sign-in would lose their progress.
+ */
+export async function withAgentProfileTab(
+  ctx: ToolContext,
+  url: string
+): Promise<{ page: Page; close: () => Promise<void> }> {
+  const c = await getContext(ctx);
+  const p = await c.newPage();
+  await p.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+  return {
+    page: p,
+    close: async () => {
+      await p.close().catch(() => {});
+    },
+  };
+}
+
 /** Compact DOM summary: interactive elements with refs the model can click/type via. */
 async function domSummary(p: Page): Promise<string> {
   const items = await p.evaluate(() => {

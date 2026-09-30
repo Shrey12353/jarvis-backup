@@ -17,6 +17,9 @@ import { memoryTools } from "./tools/memory-tools.js";
 import { reminderTools } from "./tools/reminders.js";
 import { pcTools } from "./tools/pc.js";
 import { activityTools } from "./tools/activity.js";
+import { officeTools } from "./tools/office.js";
+import { strategyTools } from "./tools/strategy-tools.js";
+import { screenerTools } from "./tools/screener.js";
 
 export function buildRegistry(): RegistryType {
   const reg = new DefaultToolRegistry();
@@ -39,6 +42,12 @@ export function buildRegistry(): RegistryType {
     reminderTools,
     pcTools,
     activityTools,
+    // Documents & visuals: spreadsheets, charts, diagrams.
+    officeTools,
+    // Custom backtest strategies the user feeds in.
+    strategyTools,
+    // Company research on the user's screening platforms (StockScans, ...).
+    screenerTools,
   ];
   for (const group of groups) {
     for (const tool of group) reg.register(tool);

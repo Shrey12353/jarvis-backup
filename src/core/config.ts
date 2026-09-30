@@ -65,8 +65,13 @@ export interface AppConfig {
 
 export const DEFAULT_CONFIG: AppConfig = {
   ollama: { host: "http://localhost:11434", model: "qwen2.5-coder:7b", vision_model: "", temperature: 0.2, num_ctx: 8192 },
-  cloud: { enabled: true, base_url: "https://api.groq.com/openai/v1", model: "openai/gpt-oss-20b", api_key: "" },
-  cloud_backup: { enabled: true, base_url: "https://openrouter.ai/api/v1", model: "deepseek/deepseek-chat-v3-0324:free", api_key: "" },
+  // Primary brain = the local FreeLLMAPI gateway (aggregates free providers and
+  // can fall back between them), with model "auto" letting it pick. Jarvis's own
+  // cloud_backup is a direct provider for when the gateway is down; the final
+  // fallback is always local Ollama. Override any of these with JARVIS_CLOUD_*
+  // / JARVIS_BACKUP_* env vars.
+  cloud: { enabled: true, base_url: "http://localhost:3001/v1", model: "auto", api_key: "" },
+  cloud_backup: { enabled: true, base_url: "https://api.groq.com/openai/v1", model: "openai/gpt-oss-20b", api_key: "" },
   agent: {
     max_steps: 25,
     full_auto: false,

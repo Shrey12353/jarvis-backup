@@ -30,6 +30,17 @@ import { parseFacts, renderFacts, addFacts, listFacts, removeFact, memoryPromptS
 import { nextDue, parseWhen, addReminder, listReminders, cancelReminder, dueReminders, markFired, firedReminders } from "../src/core/reminders.js";
 import { logActivity, readActivity, summarizeToolCall } from "../src/core/activity.js";
 import { resolveReadRoots, resolveReadablePath, isInsideRoot, expandHome } from "../src/core/config.js";
+import { officeTools } from "../src/tools/office.js";
+import { pickModelOrder, taskKindFor } from "../src/core/model-router.js";
+import { resolveResearchUrl, formatPageData } from "../src/tools/screener.js";
+import {
+  addCustomStrategy,
+  buildStrategy,
+  listCustomSpecs,
+  normalizeOp,
+  registerCustomStrategies,
+  removeCustomStrategy,
+} from "../src/trading/custom-strategy.js";
 
 test("truncate keeps short strings intact", () => {
   assert.equal(truncate("hello", 10), "hello");
@@ -971,4 +982,237 @@ test('speech capture: short blips and silence are discarded', async () => {
     if (ev?.kind === 'clip') sawClip = true;
   }
   assert.ok(!sawClip, 'a single blip must not become a clip');
+});
+
+// ---------- company research on screening platforms ----------
+
+test('research: a symbol resolves to a company page, a URL is passed through', () => {
+  assert.equal(resolveResearchUrl({ company: 'reliance' }), 'https://www.screener.in/company/RELIANCE/');
+  assert.equal(resolveResearchUrl({ company: 'TCS', consolidated: true }), 'https://www.screener.in/company/TCS/consolidated/');
+  assert.equal(resolveResearchUrl({ company: 'bajaj-finance' }), 'https://www.screener.in/company/BAJAJ-FINANCE/');
+  const direct = 'https://www.stockscans.in/some/screen';
+  assert.equal(resolveResearchUrl({ url: direct }), direct, 'a screener page URL is used as-is');
+  assert.throws(() => resolveResearchUrl({ url: 'stockscans.in' }), /http/);
+  assert.throws(() => resolveResearchUrl({}), /company/);
+});
+
+test('research: page data renders financial tables with headers even when they lack one', () => {
+  const out = formatPageData({
+    title: 'TCS',
+    url: 'https://example.test/TCS',
+    h1: 'Tata Consultancy Services',
+    ratios: ['Market Cap ₹ 12,000 Cr', 'Stock P/E 25.1'],
+    headings: [],
+    tables: [
+      [['Metric', '2024', '2023'], ['Revenue', '100', '90']],
+      [['1', '2', '3'], ['4', '5', '6']],
+    ],
+    docs: ['Annual Report 2024 -> https://example.test/ar.pdf'],
+    body: '',
+  });
+  assert.match(out, /Market Cap/);
+  assert.match(out, /\| Metric \| 2024 \| 2023 \|/);
+  assert.match(out, /\| Revenue \| 100 \| 90 \|/);
+  assert.match(out, /\| Column 1 \| Column 2 \| Column 3 \|/, 'a headerless table gets column names');
+  assert.match(out, /Annual Report 2024/);
+});
+
+test('research: an empty page explains itself instead of returning nothing', () => {
+  const out = formatPageData({ title: 't', url: 'u', h1: 'h', ratios: [], headings: ['Scans'], tables: [], docs: [], body: 'loading' });
+  assert.match(out, /No financial tables/);
+  assert.match(out, /Scans/);
+});
+
+// ---------- custom backtest strategies ----------
+
+function mkBars(cl: number[]): Bar[] {
+  return cl.map((c) => ({ date: "2024-01-01", open: c, high: c * 1.01, low: c * 0.99, close: c, volume: 1_000 }));
+}
+
+test('strategy: a rule-based strategy buys on entry, sells on exit and holds otherwise', () => {
+  const s = buildStrategy({
+    name: 'probe',
+    minBars: 2, // signals are only evaluated once i >= minBars
+    entry: [{ left: 'price', op: '>', right: 100 }],
+    exit: [{ left: 'price', op: '<', right: 50 }],
+  });
+  const bars = mkBars([90, 110, 115, 40]);
+  assert.equal(s.signal(bars, 1), 'hold', 'too little history');
+  assert.equal(s.signal(bars, 2), 'buy');
+  assert.equal(s.signal(bars, 3), 'sell');
+});
+
+test('strategy: cross_above only fires on the crossing bar, not after', () => {
+  const s = buildStrategy({ name: 'x', minBars: 2, entry: [{ left: 'price', op: 'cross_above', right: 100 }] });
+  const bars = mkBars([90, 95, 105, 108]);
+  assert.equal(s.signal(bars, 2), 'buy', 'the bar that crosses');
+  assert.equal(s.signal(bars, 3), 'hold', 'already above — no repeat signal');
+});
+
+test('strategy: every entry rule must agree (rules are AND-ed)', () => {
+  const s = buildStrategy({
+    name: 'and',
+    minBars: 2,
+    entry: [
+      { left: 'price', op: '>', right: 100 },
+      { left: 'price', op: '<', right: 120 },
+    ],
+  });
+  const bars = mkBars([90, 110, 115, 130]);
+  assert.equal(s.signal(bars, 2), 'buy', 'both rules true');
+  assert.equal(s.signal(bars, 3), 'hold', 'the upper bound now fails');
+});
+
+test('strategy: operator aliases and bad input are handled', () => {
+  assert.equal(normalizeOp('crosses_above'), 'cross_above');
+  assert.equal(normalizeOp('below'), '<');
+  assert.throws(() => normalizeOp('~='), /unsupported operator/);
+});
+
+test('strategy: saved strategies load, register and are removable', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'jarvis-strat-'));
+  const res = await addCustomStrategy(dir, {
+    name: 'My Test Strat',
+    entry: [{ left: 'price', op: '>', right: 'sma(200)' }],
+    exit: [{ left: 'rsi(14)', op: '>', right: 75 }],
+  });
+  assert.equal(res.key, 'my-test-strat');
+  assert.ok(strategies['my-test-strat'], 'registered so trade_backtest can run it');
+
+  const loaded = await registerCustomStrategies(dir);
+  assert.ok(loaded.includes('my-test-strat'), 'reloading from disk re-registers it');
+  const specs = await listCustomSpecs(dir);
+  assert.equal(specs[0].name, 'My Test Strat');
+  assert.match(String(specs[0].description), /buy when price > sma\(200\)/);
+
+  assert.equal(await removeCustomStrategy(dir, 'my-test-strat'), true);
+  assert.ok(!strategies['my-test-strat'], 'removal unregisters it');
+  assert.deepEqual(await listCustomSpecs(dir), []);
+});
+
+test('strategy: bad specs are rejected before they can waste a backtest', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'jarvis-strat-'));
+  await assert.rejects(
+    () => addCustomStrategy(dir, { name: 'trend-cross', entry: [{ left: 'price', op: '>', right: 1 }] }),
+    /built-in/
+  );
+  await assert.rejects(
+    () => addCustomStrategy(dir, { name: 'Bad Op', entry: [{ left: 'price', op: '~~', right: 1 }] }),
+    /unsupported operator/
+  );
+  await assert.rejects(
+    () => addCustomStrategy(dir, { name: 'Bad Operand', entry: [{ left: 'wibble(5)', op: '>', right: 1 }] }),
+    /unknown operand/
+  );
+  assert.throws(() => buildStrategy({ name: 'empty', entry: [] }), /at least one entry/);
+  assert.deepEqual(await listCustomSpecs(dir), [], 'nothing invalid was written');
+});
+
+// ---------- model routing (FreeLLMAPI aggregator) ----------
+
+test('router: a tool pass prefers a tool-calling model and keeps auto last', () => {
+  const order = pickModelOrder('tools', ['auto', 'gpt-oss-20b', 'dots-3-note-preview', 'gemini-2.5-flash'], '');
+  assert.equal(order[0], 'gpt-oss-20b', 'the tool model must come first');
+  assert.equal(order[order.length - 1], 'auto', 'auto is only the safety net');
+  assert.ok(!order.includes('dots-3-note-preview'), 'unlisted models are not chosen');
+});
+
+test('router: the model that just worked stays first (no thrashing)', () => {
+  const order = pickModelOrder('general', ['auto', 'gemini-2.5-flash', 'gpt-oss-20b'], 'gpt-oss-20b');
+  assert.equal(order[0], 'gpt-oss-20b');
+  assert.equal(order[1], 'gemini-2.5-flash');
+});
+
+test('router: models the gateway does not offer are skipped, and auto is never dropped', () => {
+  const order = pickModelOrder('code', ['auto', 'qwen2.5-coder-32b'], '');
+  assert.deepEqual(order, ['qwen2.5-coder-32b', 'auto'], 'only real models, then auto');
+  // With no model list at all we still return something usable.
+  assert.deepEqual(pickModelOrder('tools', [], ''), ['gpt-oss-20b', 'openai/gpt-oss-20b', 'gpt-oss-120b', 'auto']);
+});
+
+test('router: the job kind is inferred from the message and tool availability', () => {
+  assert.equal(taskKindFor('anything at all', true), 'tools', 'tool schemas present => tools');
+  assert.equal(taskKindFor('fix the bug in my python script', false), 'code');
+  assert.equal(taskKindFor('hi', false), 'fast');
+  assert.equal(taskKindFor('summarise this quarter for me', false), 'general');
+});
+
+// ---------- office tools: spreadsheets, charts, diagrams ----------
+
+function officeCtx(workspace: string) {
+  return { cfg: { agent: { workspace, read_roots: [] } }, confirm: async () => true } as never;
+}
+
+const officeTool = (name: string) => {
+  const t = officeTools.find((x) => x.name === name);
+  assert.ok(t, `missing tool ${name}`);
+  return t!;
+};
+
+test('office: write_spreadsheet then read_spreadsheet round-trips an xlsx', async () => {
+  const ws = await fs.mkdtemp(path.join(os.tmpdir(), 'jarvis-office-'));
+  const ctx = officeCtx(ws);
+  const out = await officeTool('write_spreadsheet').run(
+    { path: 'reports/sales.xlsx', rows: [['Month', 'Sales'], ['Jan', 100], ['Feb', 250]] },
+    ctx
+  );
+  assert.match(out, /reports\/sales\.xlsx/);
+  assert.ok(existsSync(path.join(ws, 'reports', 'sales.xlsx')), 'the workbook must exist on disk');
+
+  const back = await officeTool('read_spreadsheet').run({ path: 'reports/sales.xlsx' }, ctx);
+  assert.match(back, /\| Month \| Sales \|/, 'headers must come back as a markdown table');
+  assert.match(back, /\| Feb \| 250 \|/);
+});
+
+test('office: read_spreadsheet accepts raw CSV text written by write_spreadsheet', async () => {
+  const ws = await fs.mkdtemp(path.join(os.tmpdir(), 'jarvis-office-'));
+  const ctx = officeCtx(ws);
+  await officeTool('write_spreadsheet').run({ path: 'a.csv', csv: 'name,qty\npen,3\nink,5' }, ctx);
+  const back = await officeTool('read_spreadsheet').run({ path: 'a.csv' }, ctx);
+  assert.match(back, /\| name \| qty \|/);
+  assert.match(back, /\| ink \| 5 \|/);
+});
+
+test('office: make_chart writes a renderable SVG and returns display markdown', async () => {
+  const ws = await fs.mkdtemp(path.join(os.tmpdir(), 'jarvis-office-'));
+  const out = await officeTool('make_chart').run(
+    { type: 'bar', title: 'Sales', labels: ['Jan', 'Feb'], values: [100, 250] },
+    officeCtx(ws)
+  );
+  assert.match(out, /!\[Sales\]\(local:charts\/sales\.svg\)/, 'must tell the model how to display it');
+  const svg = await fs.readFile(path.join(ws, 'charts', 'sales.svg'), 'utf8');
+  assert.ok(svg.startsWith('<svg'), 'a real SVG file must be written');
+  assert.match(svg, /<rect/);
+});
+
+test('office: make_diagram draws one box per step and links them', async () => {
+  const ws = await fs.mkdtemp(path.join(os.tmpdir(), 'jarvis-office-'));
+  const out = await officeTool('make_diagram').run({ title: 'Flow', steps: ['Start', 'Work', 'Done'] }, officeCtx(ws));
+  assert.match(out, /3 boxes, 2 arrows/);
+  const svg = await fs.readFile(path.join(ws, 'diagrams', 'flow.svg'), 'utf8');
+  assert.equal((svg.match(/<rect/g) ?? []).length, 4, '3 boxes + the background rect');
+  assert.match(svg, /marker-end="url\(#arrow\)"/);
+});
+
+test('office: make_chart forces a .svg extension even when the model asks for .png', async () => {
+  const ws = await fs.mkdtemp(path.join(os.tmpdir(), 'jarvis-office-'));
+  const out = await officeTool('make_chart').run(
+    { type: 'bar', title: 'Rainfall', labels: ['Mon'], values: [5], path: 'rainfall_chart.png' },
+    officeCtx(ws)
+  );
+  // SVG bytes in a .png file would be served as PNG and never render.
+  assert.match(out, /rainfall_chart\.svg/);
+  assert.ok(existsSync(path.join(ws, 'rainfall_chart.svg')));
+  assert.ok(!existsSync(path.join(ws, 'rainfall_chart.png')));
+});
+
+test('office: chart/diagram/text is escaped so a title cannot break the SVG', async () => {
+  const ws = await fs.mkdtemp(path.join(os.tmpdir(), 'jarvis-office-'));
+  await officeTool('make_chart').run(
+    { type: 'pie', title: '<script>x</script>', labels: ['a'], values: [1] },
+    officeCtx(ws)
+  );
+  const svg = await fs.readFile(path.join(ws, 'charts', 'script-x-script.svg'), 'utf8');
+  assert.ok(!svg.includes('<script>'), 'raw markup must be escaped');
+  assert.match(svg, /&lt;script&gt;/);
 });
